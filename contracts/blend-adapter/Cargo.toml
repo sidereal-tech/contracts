@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "sidereal-sy-wrapper"
+name = "sidereal-blend-adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,7 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
-sidereal-blend-adapter = { path = "../blend-adapter" }
-sidereal-shared-types = { path = "../shared/types" }
 soroban-sdk.workspace = true
 
 [dev-dependencies]
