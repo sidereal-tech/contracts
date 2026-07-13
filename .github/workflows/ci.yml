@@ -15,7 +15,7 @@ jobs:
     name: contracts (cargo test + wasm build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -49,7 +49,7 @@ jobs:
     name: reproducible build (determinism + manifest drift)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so scripts/verify-reproducible-build.sh can create a
           # clean worktree for HEAD (and any committed source_commit).
