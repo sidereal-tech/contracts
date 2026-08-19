@@ -55,7 +55,7 @@ fn deploy(env: Env) -> Market {
     SyWrapperClient::new(&env, &sy).initialize(&admin, &underlying);
     sidereal_pt_token::PtTokenClient::new(&env, &pt).initialize(&admin, &tokenizer, &sy, &MATURITY);
     sidereal_yt_token::YtTokenClient::new(&env, &yt).initialize(&admin, &tokenizer, &sy, &MATURITY);
-    TokenizerClient::new(&env, &tokenizer).initialize(&admin, &sy, &pt, &yt, &MATURITY);
+    TokenizerClient::new(&env, &tokenizer).initialize(&admin, &sy, &pt, &yt, &MATURITY, &admin, &0_i128);
     AmmMarketClient::new(&env, &amm).initialize(
         &admin,
         &pt,

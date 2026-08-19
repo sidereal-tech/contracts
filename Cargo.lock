@@ -1503,6 +1503,9 @@ dependencies = [
  "sidereal-blend-adapter",
  "sidereal-pt-token",
  "sidereal-shared-types",
+ "sidereal-strategy-blend",
+ "sidereal-strategy-interface",
+ "sidereal-sy-vault-v2",
  "sidereal-sy-wrapper",
  "sidereal-tokenizer",
  "sidereal-yt-token",
@@ -1520,6 +1523,31 @@ dependencies = [
 name = "sidereal-shared-types"
 version = "0.1.0"
 dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "sidereal-strategy-blend"
+version = "0.1.0"
+dependencies = [
+ "sidereal-blend-adapter",
+ "sidereal-strategy-interface",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "sidereal-strategy-interface"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "sidereal-sy-vault-v2"
+version = "0.1.0"
+dependencies = [
+ "sidereal-shared-types",
+ "sidereal-strategy-interface",
  "soroban-sdk",
 ]
 

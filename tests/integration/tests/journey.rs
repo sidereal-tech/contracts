@@ -61,7 +61,7 @@ fn deploy(env: &Env) -> Market {
     SyWrapperClient::new(env, &sy).initialize(&admin, &underlying);
     sidereal_pt_token::PtTokenClient::new(env, &pt).initialize(&admin, &tokenizer, &sy, &MATURITY);
     sidereal_yt_token::YtTokenClient::new(env, &yt).initialize(&admin, &tokenizer, &sy, &MATURITY);
-    TokenizerClient::new(env, &tokenizer).initialize(&admin, &sy, &pt, &yt, &MATURITY);
+    TokenizerClient::new(env, &tokenizer).initialize(&admin, &sy, &pt, &yt, &MATURITY, &admin, &0_i128);
     AmmMarketClient::new(env, &amm).initialize(
         &admin,
         &pt,
@@ -95,16 +95,31 @@ fn deploy_settlement_amm(env: &Env) -> SettlementMarket {
     let pt = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
-    let sy = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
     let yt = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
+
+    // SY must be a real vault, not a bare asset contract: the AMM reads
+    // `exchange_rate()` off the SY token to convert between asset-denominated PT
+    // face and SY shares, and a token with no rate to read is exactly the
+    // index-blind pricing that made a mint-and-dump against the pool free. Idle
+    // custody (no Blend pool) starts at rate 1.0 and exposes `set_exchange_rate`,
+    // so a settlement-only fixture keeps its arithmetic while still answering
+    // the one question the curve has to ask.
+    let underlying = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let sy = env.register(SyWrapper, ());
+    SyWrapperClient::new(env, &sy).initialize(&admin, &underlying);
+
     let amm = env.register(AmmMarket, ());
 
     token::StellarAssetClient::new(env, &pt).mint(&user, &2_000_000_000_000_i128);
-    token::StellarAssetClient::new(env, &sy).mint(&user, &2_000_000_000_000_i128);
+    // Balances now arrive by depositing underlying rather than minting SY
+    // directly. At rate 1.0 the share count is unchanged, so every downstream
+    // assertion holds as written.
+    token::StellarAssetClient::new(env, &underlying).mint(&user, &2_000_000_000_000_i128);
+    SyWrapperClient::new(env, &sy).deposit(&user, &2_000_000_000_000_i128);
 
     AmmMarketClient::new(env, &amm).initialize(
         &admin,
@@ -266,9 +281,19 @@ fn yt_flash_route_round_trips_through_the_tokenizer() {
     );
 }
 
+/// The flash route used to over-mint YT at non-unit rates and leave the excess
+/// standing in the pool. That dust was a symptom of the index-blind curve
+/// (audit C1/H1): the route converted face to shares while the curve did not, so
+/// the two disagreed by exactly the accrual. With the curve converting at the
+/// same boundary, the pair matches exactly and there is no residue to strand.
+///
+/// This test previously *required* dust to appear, which made it a regression
+/// test for the bug rather than for the property. It now asserts the stronger
+/// post-fix invariant — the route mints a matched pair and the pool ends holding
+/// no YT at any rate in the sweep — while keeping the reconciliation check that
+/// was the original point.
 #[test]
-fn flash_route_over_mint_dust_stays_a_matched_pair_and_never_panics() {
-    let mut saw_dust = false;
+fn flash_route_mints_a_matched_pair_and_leaves_no_dust_at_any_rate() {
     for rate_bump in [40, 55, 60, 65, 75, 90, 110, 130] {
         let env = Env::default();
         let m = deploy(&env);
@@ -289,26 +314,28 @@ fn flash_route_over_mint_dust_stays_a_matched_pair_and_never_panics() {
         let sy_in = 1_000_000_i128;
         let yt_out = amm.swap_sy_for_yt(&m.user, &sy_in, &1);
 
+        // Guard against a vacuous pass: if the route stopped executing, every
+        // assertion below would hold trivially at yt_out == 0.
+        assert!(
+            yt_out > 0,
+            "rate {rate}: the flash route must actually execute, got yt_out = {yt_out}"
+        );
         assert_eq!(
             yt.balance(&m.user),
             yt_before + yt_out,
-            "buyer receives exactly yt_out regardless of dust"
+            "rate {rate}: buyer receives exactly yt_out"
         );
-
-        let pool_yt = yt.balance(&m.amm);
-        if pool_yt > 0 {
-            saw_dust = true;
-            assert_eq!(
-                amm.reserve_sy(),
-                sy.balance(&m.amm),
-                "reserves stay reconciled to actual SY balance even with standing dust"
-            );
-        }
+        assert_eq!(
+            amm.reserve_sy(),
+            sy.balance(&m.amm),
+            "rate {rate}: reserves stay reconciled to the actual SY balance"
+        );
+        assert_eq!(
+            yt.balance(&m.amm),
+            0,
+            "rate {rate}: the pool must not retain over-minted YT"
+        );
     }
-    assert!(
-        saw_dust,
-        "the rate sweep must hit at least one dust-producing window, or this test proves nothing"
-    );
 }
 
 #[test]

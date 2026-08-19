@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "sidereal-sy-vault-v2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sidereal-shared-types = { path = "../shared/types" }
+sidereal-strategy-interface = { path = "../strategy-interface" }
+soroban-sdk.workspace = true
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

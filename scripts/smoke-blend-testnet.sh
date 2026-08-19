@@ -78,7 +78,7 @@ else
   inv "$SY" initialize_blend --admin "$ADMIN" --underlying "$UNDERLYING" --pool "$BLEND_POOL" >/dev/null; sleep 8
   inv "$PT" initialize --admin "$ADMIN" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY" >/dev/null; sleep 8
   inv "$YT" initialize --admin "$ADMIN" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY" >/dev/null; sleep 8
-  inv "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" >/dev/null; sleep 8
+  inv "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" --fee_recipient "$ADMIN" --yield_fee_bps "${YIELD_FEE_BPS:-0}" >/dev/null; sleep 8
   log "Depositing $DEPOSIT_AMOUNT reserve units into Blend"
   MINTED="$(inv "$SY" deposit --from "$ADMIN" --amount "$DEPOSIT_AMOUNT")"
   (( MINTED > 0 && MINTED <= DEPOSIT_AMOUNT )) || die "invalid SY minted: $MINTED"

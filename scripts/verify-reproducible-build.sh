@@ -45,18 +45,25 @@ MODE="diff"
 # Contract crate name -> manifest [wasm_hashes] key.
 contract_crates=(
   sidereal_sy_wrapper
+  sidereal_sy_vault_v2
+  sidereal_strategy_blend
   sidereal_pt_token
   sidereal_yt_token
   sidereal_tokenizer
   sidereal_amm
 )
+# V1 network manifests key contracts by crate role (`sy_wrapper`); per-market V2
+# manifests use the shorter role names (`sy`, `strategy`). Both are accepted so
+# one script can verify either generation.
 manifest_key_for() {
   case "$1" in
-    sidereal_sy_wrapper) echo "sy_wrapper" ;;
-    sidereal_pt_token)   echo "pt_token" ;;
-    sidereal_yt_token)   echo "yt_token" ;;
-    sidereal_tokenizer)  echo "tokenizer" ;;
-    sidereal_amm)        echo "amm" ;;
+    sidereal_sy_wrapper)    echo "sy_wrapper" ;;
+    sidereal_sy_vault_v2)   echo "sy" ;;
+    sidereal_strategy_blend) echo "strategy" ;;
+    sidereal_pt_token)      echo "pt_token" ;;
+    sidereal_yt_token)      echo "yt_token" ;;
+    sidereal_tokenizer)     echo "tokenizer" ;;
+    sidereal_amm)           echo "amm" ;;
     *) die "unknown contract crate: $1" ;;
   esac
 }
@@ -130,6 +137,18 @@ manifest_wasm_hash() {
       exit
     }
   ' "$file"
+}
+
+# Every key recorded under [wasm_hashes], one per line.
+manifest_wasm_keys() {
+  awk '
+    /^\[wasm_hashes\]/ { inblk=1; next }
+    /^\[/ { inblk=0 }
+    inblk && /^[A-Za-z0-9_]+[[:space:]]*=/ {
+      sub(/[[:space:]]*=.*$/, "")
+      print
+    }
+  ' "$1"
 }
 
 # Build the given commit in a throwaway clean worktree; write optimized wasm to
@@ -216,14 +235,18 @@ Build the exact commit the manifest records: --commit $manifest_commit"
     hash_table "$WORKDIR/a" "$WORKDIR/a.hashes"
     print_table "$WORKDIR/a.hashes"
     status=0
+    verified=""
     while IFS=$'\t' read -r crate built; do
       key="$(manifest_key_for "$crate")"
       recorded="$(manifest_wasm_hash "$MANIFEST" "$key")"
+      # A manifest records only the contracts its deployment used: a V1 network
+      # manifest has no strategy, a per-market V2 manifest has no sy_wrapper.
+      # Skipping an absent key is correct; an unverified *recorded* key is not,
+      # and is caught below.
       if [[ -z "$recorded" ]]; then
-        warn "no [wasm_hashes].$key in $MANIFEST"
-        status=1
         continue
       fi
+      verified="$verified $key"
       if [[ "$built" == "$recorded" ]]; then
         printf '  \033[1;32mok\033[0m   %-22s %s\n' "$key" "$built"
       else
@@ -232,6 +255,15 @@ Build the exact commit the manifest records: --commit $manifest_commit"
         status=1
       fi
     done < "$WORKDIR/a.hashes"
+
+    # Every hash the manifest claims must have been checked against a build.
+    while read -r key; do
+      [[ -n "$key" ]] || continue
+      case " $verified " in
+        *" $key "*) ;;
+        *) warn "[wasm_hashes].$key in $MANIFEST matches no built contract"; status=1 ;;
+      esac
+    done < <(manifest_wasm_keys "$MANIFEST")
     if [[ "$status" -ne 0 ]]; then
       die "reproducibility check failed against $MANIFEST"
     fi

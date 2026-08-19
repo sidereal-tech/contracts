@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 6,
+    "address": 7,
     "nonce": 0,
     "mux_id": 0
   },
@@ -52,6 +52,12 @@
                 },
                 {
                   "u64": "1777776000"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "i128": "0"
                 }
               ]
             }
@@ -109,6 +115,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "fee_recipient"
+                            },
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "maturity"
                             },
                             "val": {
@@ -129,6 +143,14 @@
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "yield_fee_bps"
+                            },
+                            "val": {
+                              "i128": "0"
                             }
                           },
                           {

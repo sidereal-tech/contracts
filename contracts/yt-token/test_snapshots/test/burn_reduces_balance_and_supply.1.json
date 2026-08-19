@@ -81,6 +81,12 @@
                 },
                 {
                   "u64": "1777776000"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
+                  "i128": "0"
                 }
               ]
             }
@@ -352,6 +358,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "fee_recipient"
+                            },
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "maturity"
                             },
                             "val": {
@@ -372,6 +386,14 @@
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "yield_fee_bps"
+                            },
+                            "val": {
+                              "i128": "0"
                             }
                           },
                           {
@@ -463,7 +485,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Checkpoint"
+                    "symbol": "YieldBasis"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -472,7 +494,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "1000000000000000000"
+                "i128": "600"
               }
             }
           },
@@ -545,6 +567,18 @@
                         "vec": [
                           {
                             "symbol": "TotalSupply"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "600"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalYieldBasis"
                           }
                         ]
                       },

@@ -42,12 +42,21 @@ struct Market {
     pt: Address,
     yt: Address,
     tokenizer: Address,
+    fee_recipient: Address,
 }
 
 fn deploy() -> Market {
+    deploy_with_fee(0)
+}
+
+/// `yield_fee_bps` is the protocol's cut of claimed yield, fixed at
+/// initialization. Every test above runs fee-free so its arithmetic reads as the
+/// protocol's own; the fee tests opt in.
+fn deploy_with_fee(yield_fee_bps: i128) -> Market {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
 
     let underlying = env
         .register_stellar_asset_contract_v2(admin.clone())
@@ -61,7 +70,15 @@ fn deploy() -> Market {
     SyWrapperClient::new(&env, &sy).initialize(&admin, &underlying);
     PtTokenClient::new(&env, &pt).initialize(&admin, &tokenizer, &sy, &MATURITY);
     YtTokenClient::new(&env, &yt).initialize(&admin, &tokenizer, &sy, &MATURITY);
-    TokenizerClient::new(&env, &tokenizer).initialize(&admin, &sy, &pt, &yt, &MATURITY);
+    TokenizerClient::new(&env, &tokenizer).initialize(
+        &admin,
+        &sy,
+        &pt,
+        &yt,
+        &MATURITY,
+        &fee_recipient,
+        &yield_fee_bps,
+    );
 
     Market {
         env,
@@ -71,6 +88,7 @@ fn deploy() -> Market {
         pt,
         yt,
         tokenizer,
+        fee_recipient,
     }
 }
 
@@ -172,6 +190,39 @@ impl Market {
             .iter()
             .map(|h| yt.preview_claim_yield(h))
             .sum::<i128>()
+    }
+
+    fn yt_basis(&self, who: &Address) -> i128 {
+        YtTokenClient::new(&self.env, &self.yt).yield_basis(who)
+    }
+
+    /// The YT contract's aggregate ledger: every holder's yield basis plus every
+    /// holder's banked-but-unclaimed yield, in SY shares. Read in one call, with
+    /// no holder enumeration.
+    fn yt_ledger_total(&self) -> i128 {
+        let yt = YtTokenClient::new(&self.env, &self.yt);
+        yt.total_yield_basis() + yt.total_accrued_yield()
+    }
+
+    /// The rate-INDEPENDENT form of the coverage invariant, made checkable by
+    /// the aggregate ledger: the escrow, in shares, covers the SY that backs
+    /// every outstanding YT position at the rates it was acquired at, plus every
+    /// share already banked as yield.
+    ///
+    /// This is strictly stronger than `assert_escrow_covers` and needs no rate
+    /// at all, because a holder's basis is exactly "PT reservation at the
+    /// current rate + yield owed at the current rate" for any rate at or above
+    /// the one their basis was struck at. It is the invariant a pro-rata junior
+    /// split would be sized against.
+    fn assert_escrow_covers_yt_ledger(&self) {
+        let escrow = self.escrow_shares();
+        let ledger = self.yt_ledger_total();
+        assert!(
+            escrow >= ledger,
+            "escrow {} shares must cover the YT ledger (basis + banked) {}",
+            escrow,
+            ledger
+        );
     }
 
     /// The hard invariant: escrow, valued at the current rate, must cover every
@@ -901,6 +952,177 @@ fn transfer_conserves_yield_through_claims() {
     );
 }
 
+/// Audit H4, end to end: the exact reproduced exploit sequence.
+///
+/// A YT transfer during a rate dip used to re-open an already-paid yield
+/// interval. The old per-address rate checkpoint initialized a receiver that had
+/// none to the CURRENT rate, so moving fully-paid-up YT to a fresh address while
+/// the rate sat below its peak reset that YT's high-water mark downward. When the
+/// rate merely returned to the peak, two claims stood against one surplus and the
+/// first claimant took it, permanently transferring the other's entitlement.
+///
+/// The yield basis travels with the tokens, so a paid-up position stays paid up
+/// wherever it lands and there is no address whose basis is "unset".
+#[test]
+fn transfer_during_a_dip_cannot_re_open_a_paid_yield_interval() {
+    const RATE_1_05: i128 = 1_050_000_000_000_000_000;
+
+    let m = deploy();
+
+    // 1. Alice splits 100 UNIT at rate 1.00, the rate rises to 1.10, and she
+    //    claims. Her position is now paid up to 1.10.
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+    m.set_rate(RATE_1_10);
+    let alice_paid = m.claim(&alice);
+    assert_eq!(alice_paid, 90_909_090, "the audit's reproduced first claim");
+    assert_eq!(
+        YtTokenClient::new(&m.env, &m.yt).preview_claim_yield(&alice),
+        0,
+        "Alice is paid up at the peak"
+    );
+
+    // 2. The rate regresses to 1.05 and Carol splits a fresh, fully-funded
+    //    position. Her SY genuinely backs a 1.05 -> 1.10 entitlement.
+    m.set_rate(RATE_1_05);
+    let carol = m.fund(100 * UNIT);
+    m.deposit(&carol, 100 * UNIT);
+    m.split(&carol, m.sy_balance(&carol));
+    assert_eq!(m.escrow_shares(), 1_861_471_862, "the audit's escrow reading");
+
+    // 3. The exploit: Alice moves her fully-paid-up YT to a fresh address she
+    //    controls, which under the old code inherited a checkpoint of 1.05.
+    let sock_puppet = m.account();
+    m.transfer_yt(&alice, &sock_puppet, m.yt_balance(&alice));
+
+    // 4. The rate merely returns to 1.10. No yield exists beyond what Alice was
+    //    already paid, so the fresh address must be owed nothing.
+    m.set_rate(RATE_1_10);
+
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+    assert_eq!(
+        yt.preview_claim_yield(&sock_puppet),
+        0,
+        "the fresh address must not inherit a re-opened interval"
+    );
+
+    // The surplus and Carol's entitlement, recomputed independently.
+    let reservation = pt_face_reservation(m.pt_supply(), RATE_1_10);
+    let surplus = m.escrow_shares() - reservation;
+    assert_eq!(reservation, 1_818_181_818, "the audit's reservation reading");
+    assert_eq!(surplus, 43_290_044, "the audit's surplus reading");
+
+    let carol_owed = yt.preview_claim_yield(&carol);
+    assert!(
+        carol_owed > 0 && carol_owed <= surplus,
+        "exactly one claim stands against the surplus: owed {} vs surplus {}",
+        carol_owed,
+        surplus
+    );
+
+    // The invariant the audit's harness reported failing at economics.rs:185.
+    let holders = [&alice, &sock_puppet, &carol];
+    m.assert_escrow_covers(&holders);
+    m.assert_escrow_covers_yt_ledger();
+
+    // Race the claims in the exploit's own order: the sock puppet first. It must
+    // take nothing, and Carol must still collect her entitlement in full.
+    assert_eq!(m.claim(&sock_puppet), 0, "no payout to the sock puppet");
+    assert_eq!(m.sy_balance(&sock_puppet), 0);
+
+    let carol_claimed = m.claim(&carol);
+    assert_eq!(
+        carol_claimed, carol_owed,
+        "Carol's entitlement survives the sock puppet claiming first"
+    );
+    assert_eq!(m.sy_balance(&carol), carol_claimed);
+    m.assert_escrow_covers(&holders);
+    m.assert_escrow_covers_yt_ledger();
+
+    // And Alice cannot re-claim from her now-empty address either.
+    assert_eq!(m.claim(&alice), 0, "the sender kept nothing to re-claim");
+}
+
+/// Audit M4, the mirror image: re-using an address must not forfeit yield on YT
+/// acquired later at a lower rate.
+///
+/// The old per-address checkpoint was a single high-water mark over the holder's
+/// ENTIRE balance, so a holder settled at a peak who split a second, fully-funded
+/// position after a dip inherited the old peak on all of it and was owed nothing
+/// until the rate passed that peak — while a clean address doing the identical
+/// thing was owed the full amount. The forfeited value sat in escrow with no
+/// recovery path. An additive basis gives the new YT its own.
+#[test]
+fn re_using_an_address_does_not_forfeit_yield_on_yt_split_after_a_dip() {
+    const RATE_1_05: i128 = 1_050_000_000_000_000_000;
+
+    let m = deploy();
+
+    // Alice settles at the 1.10 peak on a first position.
+    let alice = m.fund(200 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+    m.set_rate(RATE_1_10);
+    assert!(m.claim(&alice) > 0, "the first position is paid at the peak");
+
+    // The rate regresses to 1.05. Alice splits a second, fully-funded position
+    // onto the SAME address; Dave splits an identical one onto a clean address.
+    // Alice splits only the shares from the new deposit, leaving the SY she was
+    // just paid alone, so the two second positions are the same size.
+    m.set_rate(RATE_1_05);
+    let alice_sy_before = m.sy_balance(&alice);
+    m.deposit(&alice, 100 * UNIT);
+    let alice_second = m.sy_balance(&alice) - alice_sy_before;
+    m.split(&alice, alice_second);
+
+    let dave = m.fund(100 * UNIT);
+    m.deposit(&dave, 100 * UNIT);
+    let dave_position = m.sy_balance(&dave);
+    assert_eq!(dave_position, alice_second, "identical second positions");
+    m.split(&dave, dave_position);
+
+    // Both second positions are struck at 1.05, so both must earn the 1.05 ->
+    // 1.10 recovery. Alice's older, already-paid half adds nothing on top.
+    assert_eq!(
+        m.yt_basis(&dave),
+        m.yt_basis(&alice) - 909_090_910,
+        "Alice's basis is her paid-up first position plus Dave's second position"
+    );
+
+    m.set_rate(RATE_1_10);
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+    let alice_owed = yt.preview_claim_yield(&alice);
+    let dave_owed = yt.preview_claim_yield(&dave);
+
+    assert!(dave_owed > 0, "the clean address earns on the dip recovery");
+    assert!(
+        (alice_owed - dave_owed).abs() <= 2,
+        "a re-used address must earn what a clean one does: alice {} vs dave {}",
+        alice_owed,
+        dave_owed
+    );
+    // The audit's measured figure for the clean address, within rounding.
+    assert!(
+        (dave_owed - 43_290_042).abs() <= 2,
+        "the second position earns 1.05 -> 1.10 on ~100 UNIT: {}",
+        dave_owed
+    );
+
+    // Both are actually payable: the escrow holds the surplus that funds them,
+    // so the value is collected rather than stranded.
+    let holders = [&alice, &dave];
+    m.assert_escrow_covers(&holders);
+    m.assert_escrow_covers_yt_ledger();
+
+    let alice_claimed = m.claim(&alice);
+    let dave_claimed = m.claim(&dave);
+    assert_eq!(alice_claimed, alice_owed, "Alice collects in full");
+    assert_eq!(dave_claimed, dave_owed, "Dave collects in full");
+    m.assert_escrow_covers(&holders);
+    m.assert_escrow_covers_yt_ledger();
+}
+
 /// Deterministic LCG so the random sequence is reproducible.
 struct Rng(u64);
 
@@ -921,41 +1143,87 @@ impl Rng {
 }
 
 /// Step 10: conservation across a long random sequence of split / transfer /
-/// claim / recombine, with a monotonically rising rate, then full drain at
+/// claim / recombine, over a rate that moves BOTH WAYS, then full drain at
 /// maturity. The escrow-coverage invariant must hold at every step (the
 /// contract also asserts the PT half on every mutation), and the escrow must
 /// drain to dust once everyone has claimed and redeemed. The economics code is
 /// pure integer math, so the native test path and the wasm path are identical.
+///
+/// The rate arm used to bump the rate upward only, which is precisely why this
+/// test was blind to audit H4 and M4: both are dip phenomena. A monotone rate
+/// makes the per-address high-water checkpoint indistinguishable from correct
+/// accounting, because the checkpoint never has an opportunity to regress on a
+/// receiver or over-hold on a re-used sender. One rate move in four now
+/// regresses, so the sequence walks through dips, recoveries, and transfers and
+/// splits inside the dip window — the exact shape of both findings.
 #[test]
 fn conservation_holds_across_random_sequences() {
     const N: u64 = 10_000;
     let m = deploy();
     let holders: std::vec::Vec<Address> = (0..3).map(|_| m.fund(1_000_000 * UNIT)).collect();
-    let refs: std::vec::Vec<&Address> = holders.iter().collect();
+
+    // Bare addresses holding no underlying: YT can only ever ARRIVE here, and
+    // each is used at most once, so its first receipt is a transfer to an
+    // address the yield ledger has never seen. This is the other half of what
+    // made H4 invisible. With three addresses that all split at the start,
+    // every transfer lands on someone who already has a yield history, and the
+    // old code's "a receiver with no checkpoint starts at the current rate"
+    // branch is never reached at all.
+    let fresh: std::vec::Vec<Address> = (0..8).map(|_| m.account()).collect();
+    let mut fresh_used: usize = 0;
+    let mut fresh_receipts_in_dip: u64 = 0;
+
+    let everyone: std::vec::Vec<Address> =
+        holders.iter().chain(fresh.iter()).cloned().collect();
+    let refs: std::vec::Vec<&Address> = everyone.iter().collect();
     let mut rng = Rng::new(0xC0FFEE);
     let mut rate = WAD;
+    // The highest rate the market has ever seen. Yield is a high-water quantity,
+    // so this is the reference point for both the recombine arm and the coverage
+    // assertion below.
+    let mut high_water = WAD;
     let mut value_ops: i128 = 0;
+    let mut dips: u64 = 0;
+    let mut recoveries: u64 = 0;
 
     for _ in 0..N {
-        let h = &holders[rng.below(holders.len() as u64) as usize];
+        let h = &everyone[rng.below(everyone.len() as u64) as usize];
         match rng.below(5) {
             0 => {
-                // deposit a random amount, then split all the SY now held
+                // deposit a random amount, then split all the SY now held.
+                // Only the funded holders can do this; a bare address has no
+                // underlying to deposit.
+                let s = &holders[rng.below(holders.len() as u64) as usize];
                 let amt = (1 + rng.below(50)) as i128 * UNIT;
-                if m.underlying_balance(h) >= amt {
-                    m.deposit(h, amt);
-                    let sy = m.sy_balance(h);
+                if m.underlying_balance(s) >= amt {
+                    m.deposit(s, amt);
+                    let sy = m.sy_balance(s);
                     if sy > 0 {
-                        m.split(h, sy);
+                        m.split(s, sy);
                         value_ops += 1;
                     }
                 }
             }
             1 => {
-                // transfer a portion of YT to another holder
+                // Transfer a portion of YT to anyone. While the rate sits BELOW
+                // its high-water mark, half the time route it to a never-used
+                // bare address instead. That combination — a dip plus a receiver
+                // the ledger has no history for — is the H4 exploit, and it is
+                // the one shape a monotone rate over a closed set of holders can
+                // never produce, which is why the property test was blind to it.
+                // An attacker picks their moment; the pool makes the sequence
+                // able to as well.
                 let bal = m.yt_balance(h);
                 if bal > 1 {
-                    let to = &holders[rng.below(holders.len() as u64) as usize];
+                    let dipped = rate < high_water;
+                    let to_idx = if dipped && fresh_used < fresh.len() && rng.below(2) == 0 {
+                        fresh_used += 1;
+                        fresh_receipts_in_dip += 1;
+                        holders.len() + fresh_used - 1
+                    } else {
+                        rng.below(everyone.len() as u64) as usize
+                    };
+                    let to = &everyone[to_idx];
                     let amount = 1 + (rng.below(bal as u64) as i128);
                     if amount <= bal {
                         m.transfer_yt(h, to, amount);
@@ -967,35 +1235,105 @@ fn conservation_holds_across_random_sequences() {
                 value_ops += 1;
             }
             3 => {
-                // recombine equal PT and YT
-                let pt = m.pt_balance(h);
-                let yt = m.yt_balance(h);
-                let max = if pt < yt { pt } else { yt };
-                if max > 0 {
-                    let amount = 1 + (rng.below(max as u64) as i128);
-                    if amount <= max {
-                        m.recombine(h, amount);
-                        value_ops += 1;
+                // Recombine equal PT and YT. Held to the high-water rate on
+                // purpose: below it the market is genuinely under-covered
+                // (yield already paid at the peak has left the escrow), and the
+                // tokenizer prices that with a pro-rata haircut computed
+                // against PT supply alone, which does not reserve for YT's
+                // junior claim. That is the tokenizer's accepted seniority
+                // policy — covered by split_and_recombine_survive_a_rate_
+                // regression — not a YT accounting question, and letting it run
+                // here would measure the haircut rather than conservation.
+                if rate >= high_water {
+                    let pt = m.pt_balance(h);
+                    let yt = m.yt_balance(h);
+                    let max = if pt < yt { pt } else { yt };
+                    if max > 0 {
+                        let amount = 1 + (rng.below(max as u64) as i128);
+                        if amount <= max {
+                            m.recombine(h, amount);
+                            value_ops += 1;
+                        }
                     }
                 }
             }
             _ => {
-                // bump the rate up by 0 to ~2%
-                rate += (rng.below(20_000_000_000_000_000) + 1) as i128;
+                // Move the rate. One move in four is a REGRESSION: the audit's
+                // H4 and M4 both live entirely below the high-water mark, and
+                // the original arm only ever bumped the rate upward, which is
+                // why the 10k-step property test could not see either of them.
+                // A dip re-opened an already-paid interval for YT moved to a
+                // fresh address (H4) and stranded the yield on YT acquired
+                // during the dip (M4); neither is reachable on a monotone path.
+                if rng.below(4) == 0 {
+                    // dip by up to ~2%, floored at 0.50 so the rate stays in a
+                    // plausible regime for a yield source that can be slashed
+                    let dip = (rng.below(20_000_000_000_000_000) + 1) as i128;
+                    if rate - dip > WAD / 2 {
+                        rate -= dip;
+                        dips += 1;
+                    }
+                } else {
+                    // bump the rate up by 0 to ~2%
+                    rate += (rng.below(20_000_000_000_000_000) + 1) as i128;
+                    if rate >= high_water {
+                        recoveries += 1;
+                    }
+                }
+                if rate > high_water {
+                    high_water = rate;
+                }
                 m.set_rate(rate);
             }
         }
 
-        m.assert_escrow_covers(&refs);
+        // The rate-independent invariant holds at EVERY step, dip or not: the
+        // escrow always covers the SY backing every outstanding YT position at
+        // the rates it was acquired at, plus every share already banked. This
+        // is what H4 broke — the exploit manufactured basis out of a dip — and
+        // it is checkable in two contract reads thanks to the aggregate ledger.
+        m.assert_escrow_covers_yt_ledger();
+
+        // The rate-dependent PT+YT form is asserted at or above the high-water
+        // mark. Strictly below it the market can be legitimately under-covered:
+        // yield paid out at an earlier peak has already left the escrow, so PT
+        // face at the dipped rate exceeds what remains. That shortfall is the
+        // priced haircut (redemption_is_capped_when_rate_regresses), not a
+        // double count. Every dip in this run is followed by a recovery, so the
+        // assertion still fires across the whole exploit window.
+        if rate >= high_water {
+            m.assert_escrow_covers(&refs);
+        }
     }
+
+    assert!(
+        dips >= 100 && recoveries >= 100,
+        "the regression arm must actually exercise dips and recoveries: {} dips, {} recoveries",
+        dips,
+        recoveries
+    );
+    assert_eq!(
+        fresh_receipts_in_dip as usize,
+        fresh.len(),
+        "every bare address must have taken its first YT during a dip, or this \
+         sequence never reaches the H4 shape it is here to cover"
+    );
+
+    // End the term recovered, so every entitlement earned across the dips is
+    // claimable and the drain below is exact rather than a haircut.
+    rate = high_water;
+    m.set_rate(rate);
+    m.observe();
+    m.assert_escrow_covers(&refs);
+    m.assert_escrow_covers_yt_ledger();
 
     // Drain everything at maturity: claim all yield, then redeem all PT.
     m.env.ledger().set_timestamp(MATURITY + 1);
-    for h in &holders {
+    for h in &everyone {
         m.claim(h);
     }
     m.assert_escrow_covers(&refs);
-    for h in &holders {
+    for h in &everyone {
         let pt = m.pt_balance(h);
         if pt > 0 {
             m.redeem_pt(h, pt);
@@ -1003,18 +1341,152 @@ fn conservation_holds_across_random_sequences() {
         }
     }
 
-    // The real conservation proof is that assert_escrow_covers held at every one
-    // of the N steps above: the escrow was never short, so no holder could be
-    // underpaid, and every claim/redeem transfer succeeded. What remains is pure
-    // floor-rounding excess that stays stuck in escrow (the safe direction): each
-    // value-moving op rounds a division down by less than ~2 shares, so the
-    // leftover is bounded linearly by the op count, not by the values involved.
-    // Measured ~1.15 shares per op; bound at 2 with a margin.
+    // Half the conservation proof is that the coverage invariants held at every
+    // one of the N steps above: the escrow was never short, so no holder could
+    // be underpaid, and every claim/redeem transfer succeeded.
+    //
+    // The other half is this bound, and over a rate that moves both ways it is
+    // the sharper of the two. Coverage is a one-sided test: it catches yield
+    // being claimed twice but not yield that can never be claimed at all, and
+    // in a long mixed sequence the two offset. Under the old per-address
+    // checkpoint every split onto an address already settled at a higher rate
+    // stranded that whole new position's yield in escrow (M4), which quietly
+    // funded the phantom claims a dip-window transfer to a fresh address opened
+    // (H4) — so coverage alone stayed green while both bugs were live. What
+    // cannot hide is the escrow at the end of the term: once every holder has
+    // claimed and every PT is redeemed, anything left is value no one could
+    // reach. Measured 7425 shares left under the old model against 349 here,
+    // and 349 is pure rounding: each value-moving op, and each transfer that
+    // slices a yield basis, rounds a division in the escrow's favor by under a
+    // share, so the residue is bounded by the op count, not by the values.
     let left = m.escrow_shares();
     assert!(
-        left <= 2 * value_ops + 16,
-        "leftover escrow {} exceeds the rounding-dust bound for {} value ops",
+        left <= value_ops / 2 + 64,
+        "leftover escrow {} exceeds the rounding-dust bound for {} value ops: \
+         value that no holder can reach is stranded, not rounded",
         left,
         value_ops
+    );
+}
+
+// --- protocol fee on claimed yield -----------------------------------------
+//
+// The fee is taken from `pay` -- the value AFTER the PT-senior cap -- so it is
+// structurally incapable of reaching PT principal. These tests pin that, plus
+// the two properties that make the fee safe to add to an immutable market at
+// all: it does not move the exchange rate, and it cannot be introduced later.
+
+/// 5% of claimed yield, comparable to what peer protocols charge.
+const FEE_500_BPS: i128 = 500;
+
+#[test]
+fn the_protocol_fee_is_skimmed_from_the_holders_yield_not_from_principal() {
+    let m = deploy_with_fee(FEE_500_BPS);
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+    m.set_rate(RATE_1_10);
+
+    let owed = yt.preview_claim_yield(&alice);
+    assert!(owed > 0, "precondition: there is yield to claim");
+
+    let escrow_before = m.escrow_shares();
+    let claimed = m.claim(&alice);
+    let fee_paid = m.sy_balance(&m.fee_recipient);
+
+    // The holder is paid net; the recipient is paid the fee; together they are
+    // exactly what left escrow. No third party, no rounding leak.
+    assert_eq!(fee_paid, owed * FEE_500_BPS / 10_000, "fee is 5% of the claim");
+    assert_eq!(claimed, owed - fee_paid, "claim() returns the NET amount");
+    assert_eq!(
+        m.sy_balance(&alice),
+        claimed,
+        "the holder receives exactly the net amount"
+    );
+    assert_eq!(
+        escrow_before - m.escrow_shares(),
+        claimed + fee_paid,
+        "escrow falls by exactly the gross, so nothing is created or stranded"
+    );
+}
+
+#[test]
+fn the_protocol_fee_never_eats_into_pt_coverage() {
+    // A dip leaves only a partial surplus over the PT reservation. The fee must
+    // come out of that surplus -- never out of the escrow PT needs -- so PT
+    // stays exactly as covered as it would be in a fee-free market.
+    let m = deploy_with_fee(FEE_500_BPS);
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+
+    m.set_rate(RATE_1_10);
+    let rate_1_05: i128 = 1_050_000_000_000_000_000;
+    m.set_rate(rate_1_05);
+
+    let escrow_before = m.escrow_shares();
+    let reservation = pt_face_reservation(m.pt_supply(), rate_1_05);
+    let surplus = escrow_before - reservation;
+    assert!(surplus > 0, "precondition: a partial surplus exists");
+
+    let claimed = m.claim(&alice);
+    let fee_paid = m.sy_balance(&m.fee_recipient);
+
+    assert_eq!(
+        claimed + fee_paid,
+        surplus,
+        "holder plus protocol together take exactly the junior surplus"
+    );
+    assert!(
+        m.escrow_shares() >= pt_face_reservation(m.pt_supply(), rate_1_05),
+        "PT reservation survives the fee: escrow {} < reservation {}",
+        m.escrow_shares(),
+        pt_face_reservation(m.pt_supply(), rate_1_05)
+    );
+}
+
+#[test]
+fn the_protocol_fee_does_not_move_the_exchange_rate() {
+    // This is the property that lets a fee exist at all in a derived-rate
+    // system: the skim moves SY shares between escrow and the recipient, so
+    // neither the strategy's assets nor the SY supply changes.
+    let m = deploy_with_fee(FEE_500_BPS);
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+    m.set_rate(RATE_1_10);
+
+    let sy = SyWrapperClient::new(&m.env, &m.sy);
+    let rate_before = sy.exchange_rate();
+    let supply_before = sy.total_supply();
+
+    let claimed = m.claim(&alice);
+    assert!(claimed > 0);
+
+    assert_eq!(sy.exchange_rate(), rate_before, "rate is untouched by the fee");
+    assert_eq!(sy.total_supply(), supply_before, "SY supply is untouched");
+}
+
+#[test]
+fn a_zero_fee_market_pays_the_holder_everything() {
+    // The default. Proves the fee path is inert at 0 rather than merely small,
+    // so every other test in this file is measuring unfee'd behaviour.
+    let m = deploy_with_fee(0);
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+    m.set_rate(RATE_1_10);
+    let owed = yt.preview_claim_yield(&alice);
+
+    let claimed = m.claim(&alice);
+    assert_eq!(claimed, owed, "the holder receives the whole claim");
+    assert_eq!(
+        m.sy_balance(&m.fee_recipient),
+        0,
+        "no fee is paid, and the recipient is never credited"
     );
 }

@@ -14,6 +14,9 @@ doctest = false
 soroban-sdk = { workspace = true, features = ["testutils"] }
 sidereal-blend-adapter = { path = "../../contracts/blend-adapter" }
 sidereal-shared-types = { path = "../../contracts/shared/types" }
+sidereal-strategy-blend = { path = "../../contracts/strategy-blend" }
+sidereal-strategy-interface = { path = "../../contracts/strategy-interface" }
+sidereal-sy-vault-v2 = { path = "../../contracts/sy-vault-v2" }
 sidereal-sy-wrapper = { path = "../../contracts/sy-wrapper" }
 sidereal-pt-token = { path = "../../contracts/pt-token" }
 sidereal-yt-token = { path = "../../contracts/yt-token" }

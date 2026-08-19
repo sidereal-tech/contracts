@@ -293,7 +293,7 @@ invoke "$PT" initialize --admin "$ADMIN" --tokenizer "$TOKENIZER" --sy_token "$S
 settle
 invoke "$YT" initialize --admin "$ADMIN" --tokenizer "$TOKENIZER" --sy_token "$SY" --maturity "$MATURITY" >/dev/null
 settle
-invoke "$TOKENIZER" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" >/dev/null
+invoke "$TOKENIZER" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" --fee_recipient "$ADMIN" --yield_fee_bps "${YIELD_FEE_BPS:-0}" >/dev/null
 settle
 invoke "$AMM" initialize \
   --admin "$ADMIN" \
