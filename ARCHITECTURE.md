@@ -312,7 +312,9 @@ actually *held* over time does reach it.
 
 Special cases:
 - First observation after `> window_size` seconds of inactivity: `twap_apy` resets to the single fresh observation and the market **re-enters warm-up**, because one trade deciding the whole average is exactly the window the TWAP exists to close. Stale TWAPs are worse than no TWAP.
-- During the first 30 minutes after pool deployment, the TWAP is marked "warming up" and external readers get a warning. Don't price loans against a 5-minute-old TWAP.
+- During the first 30 minutes after the pool is **seeded**, the TWAP is marked "warming up" and external readers get a warning. Don't price loans against a 5-minute-old TWAP.
+
+  Seeded, not deployed — and the distinction is the bug, not pedantry. `initialize` arms warm-up at deploy time, but deploy scripts do not seed in the same transaction. A market seeded more than one window later therefore reported `twap_warming_up() == false` at the exact instant one account had unilaterally set the oracle from nothing, at any implied rate the curve admits and at a proportion of their choosing — and they could withdraw the liquidity again afterwards. The seed branch now re-arms warm-up, on the same reasoning as the idle-gap rule above: one observation deciding the average is precisely what warm-up exists to flag.
 
 ---
 

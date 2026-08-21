@@ -29,6 +29,16 @@
 //!    first-depositor inflation vector straight through to the tokenizer's
 //!    PT reservation. The V1 wrapper valued only its bToken position for exactly
 //!    this reason; the seam now states it as an obligation.
+//!
+//!    Be precise about what this buys: it stops a donation repricing shares the
+//!    instant it lands, not forever. An adapter that pays redemptions out of
+//!    idle (as `strategy-blend` does, so idle is recoverable rather than
+//!    stranded) burns supply without moving the numerator, so the donation
+//!    reaches the rate at that later moment instead. That is fair — it accrues
+//!    to remaining holders, and donating is always a net loss to the donor —
+//!    but it means the rate is steerable in timing and size by whoever pays
+//!    for it. Adapters must not treat "idle excluded" as making the rate
+//!    unmovable, and consumers of the rate must tolerate a permanent step.
 
 use soroban_sdk::{contractclient, contracterror, Address, Env};
 
