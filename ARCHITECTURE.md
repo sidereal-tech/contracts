@@ -262,7 +262,7 @@ Every swap updates an exponentially-weighted moving average of the implied APY. 
 
 - Stored in contract storage, updated on every state-changing operation.
 - Exposed via a public read-only function.
-- Used by external integrators (a lending protocol that wants to use PT as collateral, for instance) to get a manipulation-resistant price.
+- Used by external integrators (a lending protocol that wants to use PT as collateral, for instance) to get a manipulation-resistant price. Integrators must gate on `twap_warming_up()` — the accumulator is only as good as the history behind it, and it reports honestly when there isn't one.
 
 **Window:** 30 minutes. Long enough that a single-block manipulation gets averaged out, short enough that it tracks real market moves.
 
@@ -272,26 +272,46 @@ Every swap updates an exponentially-weighted moving average of the implied APY. 
 
 LPs deposit PT and SY in the current pool ratio and receive LP shares. They earn:
 
-1. **Swap fees.** 0.1% on PT↔SY swaps, 0.3% on YT swaps (which go through two pool operations). Fee rates are configurable per pool at deployment.
+1. **Swap fees.** `fee_bps` on every curve operation — 0.1% on the deployed markets — configurable per pool at deployment and immutable afterwards. The fee stays in pool reserves and accrues to LPs pro-rata; there is no protocol cut.
+
+   YT swaps pay the *same* `fee_bps`, not a doubled rate: each YT route performs one curve operation, and the `split`/`recombine` leg that completes it is a free tokenizer call. But the fee is levied on the **PT notional**, which is 30–75× the SY a YT buyer actually posts, so the effective charge on a YT buyer's capital is 1.6–5% depending on leverage. That is Pendle's model working as intended; it is not a 0.1% cost to that user, and it should be quoted as a leverage-scaled fee in the UI.
 2. **PT appreciation.** The PT in the pool naturally appreciates toward 1 SY as maturity approaches. Pendle's term: "no impermanent loss at maturity" — an LP who holds to maturity is guaranteed to receive the underlying value of their initial deposit, because PT always converges to SY.
 
-For LP positions held to maturity, the protocol provides a single-transaction `zap_out_at_maturity` that removes liquidity, redeems all PT for SY, and unwraps SY to the underlying.
+For LP positions held to maturity, the exit is three transactions today: `remove_liquidity` on the AMM (which deliberately still works after maturity), `redeem_at_maturity` on the tokenizer for the PT leg, then `redeem` on the SY vault. A single-transaction `zap_out_at_maturity` is *planned, not built* — it exists in no contract and no SDK path. It belongs with the router/rollover work rather than in this section's present tense.
 
 ---
 
 ## 5. The TWAP design in detail
 
-Each swap calls `update_twap()` which performs:
+Each swap calls `sync_twap()` which performs:
 
 ```
-elapsed = current_time - last_observation_time
-weight = elapsed / window_size  // capped at 1.0
-twap_apy = twap_apy * (1 - weight) + current_apy * weight
+elapsed    = current_time - last_observation_time
+weight     = elapsed / window_size  // capped at 1.0
+twap_apy   = twap_apy * (1 - weight) + prevailing_apy * weight
 last_observation_time = current_time
 ```
 
+`prevailing_apy` is the implied rate recorded **before** this trade — the rate
+that actually held over `elapsed`. The post-trade rate is stored, not
+accumulated; it gets its weight from whichever call closes the interval it goes
+on to prevail over.
+
+That distinction is the whole security property, and getting it backwards is a
+live exploit rather than an inaccuracy. Weighting the *post-trade* rate by
+`elapsed / window` means an attacker who waits until one second short of the
+window and then trades hands their own dislocation a weight of ~0.999 — the
+oracle snaps to a price they chose — and because a same-timestamp reversal is a
+zero-length interval, they unwind in the same transaction and pay only the
+round-trip fee. Measured against the deployed configuration before the fix, that
+cost 0.10% of the pool to move the reported APY from 764 to 1747 bps, with
+`twap_warming_up()` still reporting false. Corrected in the August 2026 audit
+(finding H3); the regression tests assert both directions — that a 600× larger
+same-instant reversal cannot move the oracle further, and that a dislocation
+actually *held* over time does reach it.
+
 Special cases:
-- First observation after `> window_size` seconds of inactivity: `twap_apy` resets to `current_apy`. Stale TWAPs are worse than no TWAP.
+- First observation after `> window_size` seconds of inactivity: `twap_apy` resets to the single fresh observation and the market **re-enters warm-up**, because one trade deciding the whole average is exactly the window the TWAP exists to close. Stale TWAPs are worse than no TWAP.
 - During the first 30 minutes after pool deployment, the TWAP is marked "warming up" and external readers get a warning. Don't price loans against a 5-minute-old TWAP.
 
 ---
@@ -354,7 +374,7 @@ YT is already implicitly an option on yield direction. Building an explicit opti
 These are deliberately unresolved. They need discussion before being settled:
 
 1. **Initial rate anchor.** How do we set the initial `rate anchor` for a new pool? Options: (a) read current Blend APY and seed at that, (b) start at 5% and let the market discover, (c) let a curator set it. Leaning toward (a).
-2. **Fee distribution.** Where do swap fees go in v1 without a governance token? Options: (a) entirely to LPs, (b) split between LPs and a protocol treasury, (c) burn. Leaning toward (a) for simplicity.
+2. ~~**Fee distribution.**~~ **Settled by deployment, not by decision.** V1 shipped option (a), entirely to LPs, and the contracts are immutable, so there is no fee recipient anywhere in the deployed system and no way to add one. The live question is now a V2 question and it is time-boxed: the V2 vault has no admin entrypoint at all, so a fee must be compiled into the wasm and set at `initialize` or it can never exist for that market. See `docs/audit/2026-08-internal-audit.md` M5 for the one insertion point that does not disturb the derived rate or PT seniority.
 3. **Maturity rollover UX.** When a pool reaches maturity and we deploy a new one, how does the frontend present the choice between redeeming and rolling into the new maturity? Out of MVP scope but worth thinking through.
 4. **KYB-gated pools for institutions.** Should some pools (deJTRSY in particular) require verified counterparts to mint, the way PagFinance's BRLP gates trustlines? Not in MVP but a real conversation for the institutional pitch.
 

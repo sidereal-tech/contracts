@@ -14,8 +14,12 @@ cd "$REPO"
 
 OPT_WASM_DIR="${OPT_WASM_DIR:-target/wasm32v1-none/release/optimized}"
 
+# Every cdylib crate in the workspace. `sidereal_strategy_interface` is a plain
+# rlib (client bindings only) and is deliberately absent, like the Blend adapter.
 contracts=(
   sidereal_sy_wrapper
+  sidereal_sy_vault_v2
+  sidereal_strategy_blend
   sidereal_pt_token
   sidereal_yt_token
   sidereal_tokenizer
@@ -40,12 +44,11 @@ stellar contract build --locked --out-dir "$OPT_WASM_DIR"
 
 if [[ "${SKIP_WASM_FLOAT_CHECK:-0}" != "1" ]]; then
   require_cmd wasm-objdump
-  bash scripts/check-wasm-floats.sh \
-    "$OPT_WASM_DIR/sidereal_sy_wrapper.wasm" \
-    "$OPT_WASM_DIR/sidereal_pt_token.wasm" \
-    "$OPT_WASM_DIR/sidereal_yt_token.wasm" \
-    "$OPT_WASM_DIR/sidereal_tokenizer.wasm" \
-    "$OPT_WASM_DIR/sidereal_amm.wasm"
+  float_check_args=()
+  for contract in "${contracts[@]}"; do
+    float_check_args+=("$OPT_WASM_DIR/$contract.wasm")
+  done
+  bash scripts/check-wasm-floats.sh "${float_check_args[@]}"
 fi
 
 log "Deployable Wasm sizes"

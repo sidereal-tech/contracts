@@ -343,7 +343,10 @@ log "Initializing YT token"
 invoke_once INIT_YT "$YT" initialize --admin "$DEPLOYER_ADDRESS" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY"
 
 log "Initializing tokenizer"
-invoke_once INIT_TK "$TK" initialize --admin "$DEPLOYER_ADDRESS" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY"
+# Fee on claimed yield, immutable after this call. Defaults to 0 so a testnet
+# deploy never invents protocol economics; set YIELD_FEE_BPS to opt in.
+invoke_once INIT_TK "$TK" initialize --admin "$DEPLOYER_ADDRESS" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" \
+  --fee_recipient "${FEE_RECIPIENT:-$DEPLOYER_ADDRESS}" --yield_fee_bps "${YIELD_FEE_BPS:-0}"
 
 log "Initializing AMM"
 invoke_once INIT_AMM "$AMM" initialize \

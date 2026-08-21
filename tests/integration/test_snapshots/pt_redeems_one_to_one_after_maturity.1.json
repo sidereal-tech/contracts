@@ -153,6 +153,12 @@
                 },
                 {
                   "u64": "1000000"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
+                  "i128": "0"
                 }
               ]
             }
@@ -909,7 +915,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Checkpoint"
+                    "symbol": "YieldBasis"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -918,7 +924,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "1000000000000000000"
+                "i128": "500000000"
               }
             }
           },
@@ -997,6 +1003,18 @@
                       "val": {
                         "i128": "500000000"
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalYieldBasis"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "500000000"
+                      }
                     }
                   ]
                 }
@@ -1042,6 +1060,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "fee_recipient"
+                            },
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "maturity"
                             },
                             "val": {
@@ -1062,6 +1088,14 @@
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "yield_fee_bps"
+                            },
+                            "val": {
+                              "i128": "0"
                             }
                           },
                           {

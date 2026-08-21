@@ -4,6 +4,19 @@
 # working tree had only non-source files dirty — testnet manifests and docs).
 # All five wasm hashes were verified equal to the on-chain code hashes.
 
+# Retired 2026-08-18. The pilot matured 2026-08-09 having proven what it was for
+# (five immutable contracts, real funds, a full lifecycle on mainnet) and is not
+# being wound down or migrated -- V2 deploys at new addresses regardless. The
+# keeper skips retired markets, so it does not warn forever about upkeep nobody
+# intends to perform. Kept as deployment provenance.
+#
+# Consequence, recorded rather than left implicit: the maturity rate was never
+# frozen and can no longer be improved (`observe_rate` is gated on a live
+# market), so if anyone ever does redeem here, YT settles at roughly 2% of what
+# it earned and the remainder goes to PT. Total value at stake is ~$10.70, of
+# which the deployer holds 96% of the YT and the AMM holds 96% of the PT.
+retired = true
+
 network = "mainnet"
 network_passphrase = "Public Global Stellar Network ; September 2015"
 source_repo = "https://github.com/PoulavBhowmick03/sidereal"
@@ -57,4 +70,5 @@ amm = "1546eec842a3c777f5f6f87191760242d09459206312fcccf4c5ae262fd709a4"
 
 [notes]
 admin_custody = "single key = the deployer key (in the local stellar-cli keystore). Only lever is the constrained migrate_reserve_index. Can be imported into a mobile wallet."
-maturity_ttl = "contract code/instance entries provisioned at the mainnet minimum persistent TTL (120 days), which covers the 30-day market plus redemption grace; no renewal needed for a one-shot cycle."
+maturity_ttl = "contract code/instance entries provisioned at the mainnet minimum persistent TTL (120 days). MEASURED 2026-08-17: the vault instance entry expires at ledger 65488004 and Blend's Positions(vault) entry at 65489595 -- both around 2026-11-11. The original 'no renewal needed for a one-shot cycle' note holds ONLY if every holder exits before then; it is not true for a position left outstanding. Funds are recoverable either way (RestoreFootprint is permissionless) but the app offers no restore path. A zero-value self-approve renews the vault instance for free; only a value-moving deposit or redeem renews Blend's entry."
+keeper = "this market predates the per-market layout under deployments/markets/, so scripts/keeper.mjs could not see it and its 2026-08-09 maturity passed with the rate unfrozen. keeper.mjs now loads it explicitly as a legacy market; mainnet upkeep needs MAINNET_RPC_URL set, because the stellar-cli mainnet alias ships with no RPC URL."

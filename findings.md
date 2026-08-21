@@ -168,3 +168,52 @@ Not covered (still owed, see evaluation.md): a wallet-signed end-to-end run thro
 (the e2e flow spec is still gated, no automated signer), an LP-archival restore drill, and
 multi-user concurrency under sustained load. No mainnet action was taken — this is testnet
 validation of the fa2deb7 bytecode, not a deploy.
+
+**M6 — AMM curve mixes SY shares with asset-unit PT face** (post-launch review, 2026-07-18).
+The time-decay curve consumes `total_sy` as raw SY *shares* while `total_pt` is asset-unit
+face. The mismatch is a single line: `amm/src/lib.rs:799` reads `let total_asset =
+state.total_sy;` — a variable named for assets, assigned shares, with no index conversion.
+Pendle's `MarketMathCore` values the SY reserve at the index (`totalSy → asset`) before
+curve math and converts outputs back; in v1 only the YT flash routes perform that boundary
+conversion, and the plain PT↔SY legs do not. So `exchange_rate` (lib.rs:1216-1242) is a
+face-per-*share* factor rather than face-per-asset, and its reciprocal is shares paid per
+unit of PT face.
+**Consequences at SY rate R > 1:** the curve's maturity convergence pins PT face to one SY
+share (= R assets) against a redemption value of one asset — an (R−1)-bounded LP leak near
+maturity; and the quoted implied APY (lib.rs:1183-1200) is share-denominated, so it drifts
+from the true fixed rate as R accrues.
+**Bounding:** the live market is short (30 days) and small (~5 PT + 5 SY seeded), but its
+exact loss cannot be derived from the `1.0063` initial anchor — that parameter is a seeded
+target, not the live SY rate. At an illustrative 8% annualized SY return, 30 days of accrual
+is roughly 0.66% before the single 10-bps PT-sale fee; actual impact must be measured from
+on-chain rate observations. The defect scales with term and with realized SY return.
+**Why the suites missed it:** the 10,000-case AMM property test
+(`amm/src/lib.rs:2488-2495`) builds on a fixture whose SY sits at the default rate 1.0 —
+"where SY shares and asset units coincide", as the fixture comment itself says
+(lib.rs:1506-1510). That is precisely the rate at which this deviation vanishes identically.
+The non-par cases live in `tests/integration` and exercise only the flash routes, which *do*
+perform the boundary conversion.
+**Status (2026-07-18): ACCEPTED for v1, FIX SCOPED for v2.** The deployed AMM is immutable
+and runs out its term with the deviation documented. The factory-built AMM v2 normalizes
+units per Pendle (SY reserves valued at the index inside the curve, outputs converted back)
+and gates on the property suite re-run at non-par SY rates (R ∈ {1.0, 1.01, 1.05, 1.1}),
+direct PT↔SY quote/execution tests at each rate, and a maturity-convergence test asserting
+PT → asset par. Hard prerequisite for maturities longer than the current 30 days.
+
+**RESOLVED 2026-08-18** (audit finding C1, see `docs/audit/2026-08-internal-audit.md`).
+The curve is now asset-denominated on both sides: `Precompute` carries the SY rate, read
+once per invocation from the same `exchange_rate` entrypoint the tokenizer prices splits
+against, and outputs convert back to shares with ceil-in/floor-out at the boundary. Fixing
+it also repaired the YT routes, which had been reverting for every sell size once the
+wrapper accrued past ~0.5% (finding H1).
+
+One correction to the bounding above: the break-even is `e < R`, where `R` is the SY
+wrapper's *cumulative* appreciation since its own inception — not the market's term. A
+wrapper reused across a series of maturities carries all prior accrual forward, so the
+"30 days of accrual ≈ 0.66%" figure understates it. After a year at 8%, the first 30-day
+market minted on that wrapper opens with a standing 2–7% arbitrage against LPs regardless
+of its own length. The correct bound is `1 − e/R`.
+
+The property suite now sweeps R ∈ {1.0, 1.01, 1.05, 1.10} across the plain PT↔SY legs *and*
+both YT flash routes, with a maturity-convergence test at non-unit rates. Reverting the fix
+turns 5 tests plus the proptest red.

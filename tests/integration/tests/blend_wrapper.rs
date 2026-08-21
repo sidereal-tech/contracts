@@ -290,7 +290,7 @@ fn blend_supply_rate_growth_yield_claim_and_withdraw_round_trip() {
     PtTokenClient::new(&env, &pt).initialize(&admin, &tokenizer, &sy, &MATURITY);
     YtTokenClient::new(&env, &yt).initialize(&admin, &tokenizer, &sy, &MATURITY);
     let tokenizer_client = TokenizerClient::new(&env, &tokenizer);
-    tokenizer_client.initialize(&admin, &sy, &pt, &yt, &MATURITY);
+    tokenizer_client.initialize(&admin, &sy, &pt, &yt, &MATURITY, &admin, &0_i128);
 
     token::StellarAssetClient::new(&env, &underlying).mint(&alice, &(100 * UNIT));
     let initial_b_rate = 1_055_791_870_000;

@@ -205,7 +205,7 @@ log "Initializing"
 inv "$SY" initialize --admin "$ADMIN" --underlying "$UNDERLYING" >/dev/null; settle
 inv "$PT" initialize --admin "$ADMIN" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY" >/dev/null; settle
 inv "$YT" initialize --admin "$ADMIN" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY" >/dev/null; settle
-inv "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" >/dev/null; settle
+inv "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" --fee_recipient "$ADMIN" --yield_fee_bps "${YIELD_FEE_BPS:-0}" >/dev/null; settle
 
 # Running expectation of the holder's SY balance, advanced step by step.
 sy_expected=0

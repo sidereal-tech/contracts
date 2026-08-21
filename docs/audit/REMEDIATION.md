@@ -1,0 +1,73 @@
+# Audit remediation tracker
+
+Tracks fixes for the findings in [`2026-06-pre-testnet.md`](./2026-06-pre-testnet.md).
+Audit verdict: **NO-GO for testnet** until the two HIGH findings are fixed with
+tests. H1, H2, and M2 were independently re-verified against source on
+2026-06-24 and confirmed real.
+
+Status: ☐ open · ◐ in progress · ☑ fixed (with test)
+
+## Gate to testnet (must all be ☑)
+
+| ID | Severity | Finding | Owner | Status |
+|----|----------|---------|-------|--------|
+| H1 | HIGH | LP shares are global; any caller can remove pool liquidity | AMM | ☑ |
+| H2 | HIGH | Same-ledger swaps overwrite the TWAP with spot | AMM | ☑ |
+| M2 | MED  | SY methods mutate state before initialization | SY wrapper | ☑ |
+| M3 | MED  | Tokenization state uses unchecked i128 arithmetic | SY wrapper, tokenizer | ☑ |
+| M1 | MED  | SY exact-in swaps do not account for the full `sy_in` | AMM | ☑ |
+
+## Recommended for testnet (☑ or a written accept-risk note)
+
+| ID | Severity | Finding | Owner | Status |
+|----|----------|---------|-------|--------|
+| M4 | MED | AMM curve math uses `f64` (precision loss at bounds) | AMM | ☑ |
+| L1 | LOW | Unauthorized admin calls return `NotInitialized` | SY wrapper, YT | ◐ SY wrapper fixed (`NotAuthorized = 12`, used in `set_exchange_rate` and `migrate_reserve_index`); YT still has no `NotAuthorized` variant |
+| L2 | LOW | Long-lived instance state has no TTL/bump strategy | AMM, tokenization, ops | ◐ AMM fixed; tokenization pending |
+
+## Fix notes (acceptance = the fix lands AND a test proves it)
+
+- **H1** — add per-holder LP accounting (`LpBalance(Address)` key). `add_liquidity`
+  credits only `from`; `remove_liquidity` requires `lp_in <= holder_lp`, debits the
+  holder before reducing reserves. Test: a non-LP caller's `remove_liquidity` fails.
+- **H2** — in `sync_twap`, when `elapsed == 0` leave `twap_ln_implied_rate` and
+  `last_observation` unchanged (give same-ledger observations zero time weight).
+  Test: two swaps at the same timestamp; assert the TWAP does not move to the
+  second swap's spot value.
+- **M1** — decide exact-in vs max-in for `swap_sy_for_pt` / SY->YT. For exact-in,
+  add the full `sy_in` to reserves and fee math; for max-in, return the actual
+  spent and refund/avoid the unused. Test: reserve delta equals signed input (or
+  returned spent amount).
+- **M2** — require `read_config` at the start of every public SY method except
+  `initialize`; do not default `exchange_rate` when uninitialized (return/panic
+  `NotInitialized`). Test: `deposit` before `initialize` fails.
+- **M3** — use the checked i128 helpers consistently in sy-wrapper and tokenizer
+  (the AMM already does). Reject overflow with a contract error. Tests: boundary
+  cases near `i128::MAX` for deposit, redeem, split, recombine, redeem-at-maturity.
+- **M4** — accepted-risk path for testnet: the full deterministic fixed-point
+  rewrite is deferred, and the AMM now enforces conservative bounds around the
+  remaining `f64` helpers. Bounds: PT/SY trade inputs and reserves must stay
+  `<= 1e18` raw units, `scalar_root <= 10e18`, and `initial_anchor <= 2e18`.
+  Tests: curve config above the bounds and liquidity above the reserve bound
+  both fail with `InputOutOfBounds`.
+- **L1** — add an `Unauthorized` error; return it on admin mismatch (not
+  `NotInitialized`) in `set_exchange_rate` and `seed_checkpoint`.
+- **L2** — define a TTL/bump policy for the ~3-month markets; extend instance TTL
+  on mutating entrypoints and document the maintenance expectation. AMM policy:
+  `bump_ttl` is a public keepalive entrypoint, and AMM initialization/state
+  writes extend instance+code TTL when remaining TTL falls below 30 days, back to
+  120 days. Operators should call `bump_ttl` at least monthly for idle markets;
+  active markets are bumped by normal AMM mutations. Tokenization contracts
+  still need to apply the equivalent policy to SY/tokenizer/PT/YT state before
+  L2 is fully closed.
+
+## Process
+
+- Each fix is its own PR off `main` (or grouped per owner per contract), with the
+  finding ID in the title.
+- Keep `cargo test --workspace` green; every fix adds the test named in its row.
+- Update the Status column in the same PR. Testnet deploy is unblocked when the
+  "Gate to testnet" table is all ☑ and M4/L1/L2 are either ☑ or have an
+  accept-risk note.
+- Settlement-era cautions such as checks-effects-interactions and reentrancy
+  belong with the testnet hardening checklist, not this audit table.

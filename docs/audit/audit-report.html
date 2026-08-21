@@ -1,0 +1,803 @@
+<title>Sidereal Contract Audit</title>
+<style>
+  :root {
+    --ground: #F5F7F9;
+    --surface: #FFFFFF;
+    --surface-sunk: #EDF0F3;
+    --ink: #12161C;
+    --ink-soft: #4B5563;
+    --ink-faint: #78828F;
+    --rule: #DCE1E7;
+    --rule-strong: #C3CAD3;
+    --accent: #0E6B63;
+    --accent-soft: #E0EFED;
+    --sev-crit: #A32E1F;
+    --sev-crit-bg: #F8E7E4;
+    --sev-high: #9C5A14;
+    --sev-high-bg: #F9EDDD;
+    --sev-med: #34568A;
+    --sev-med-bg: #E6ECF5;
+    --sev-low: #616B78;
+    --sev-low-bg: #EAEDF1;
+    --ok: #1F6B4A;
+
+    --display: Georgia, "Iowan Old Style", "Times New Roman", ui-serif, serif;
+    --body: Georgia, "Iowan Old Style", "Times New Roman", ui-serif, serif;
+    --ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1116;
+      --surface: #151A21;
+      --surface-sunk: #1B212A;
+      --ink: #E7EAEE;
+      --ink-soft: #A2ACB8;
+      --ink-faint: #7B8592;
+      --rule: #262D37;
+      --rule-strong: #38414D;
+      --accent: #46A99E;
+      --accent-soft: #16302E;
+      --sev-crit: #E4796A;
+      --sev-crit-bg: #331915;
+      --sev-high: #D9A05A;
+      --sev-high-bg: #2E2313;
+      --sev-med: #8DAEDC;
+      --sev-med-bg: #182231;
+      --sev-low: #99A3AF;
+      --sev-low-bg: #1D232B;
+      --ok: #5CBF92;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0E1116;
+    --surface: #151A21;
+    --surface-sunk: #1B212A;
+    --ink: #E7EAEE;
+    --ink-soft: #A2ACB8;
+    --ink-faint: #7B8592;
+    --rule: #262D37;
+    --rule-strong: #38414D;
+    --accent: #46A99E;
+    --accent-soft: #16302E;
+    --sev-crit: #E4796A;
+    --sev-crit-bg: #331915;
+    --sev-high: #D9A05A;
+    --sev-high-bg: #2E2313;
+    --sev-med: #8DAEDC;
+    --sev-med-bg: #182231;
+    --sev-low: #99A3AF;
+    --sev-low-bg: #1D232B;
+    --ok: #5CBF92;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 74ch; margin: 0 auto; }
+  .wide { max-width: 92ch; margin: 0 auto; }
+
+  /* ---------- masthead ---------- */
+
+  header.masthead {
+    padding: 72px 0 32px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 20px;
+  }
+  h1 {
+    font-family: var(--display);
+    font-size: clamp(38px, 6.5vw, 60px);
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+    font-weight: 400;
+    margin: 0 0 20px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 20px;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    margin: 0 0 32px;
+    text-wrap: pretty;
+  }
+  .meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 18px 28px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink-faint);
+  }
+  .meta div span {
+    display: block;
+    color: var(--ink);
+    margin-top: 3px;
+  }
+
+  /* ---------- sections ---------- */
+
+  section { padding-top: 60px; }
+  h2 {
+    font-family: var(--display);
+    font-size: 30px;
+    font-weight: 400;
+    letter-spacing: -0.015em;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    text-wrap: balance;
+  }
+  .section-note {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 28px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  p { margin: 0 0 18px; text-wrap: pretty; }
+  a { color: var(--accent); }
+
+  /* ---------- verdict ---------- */
+
+  .verdict { display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .verdict-row {
+    display: grid;
+    grid-template-columns: minmax(140px, 0.8fr) 2fr;
+    gap: 20px;
+    background: var(--surface);
+    padding: 16px 20px;
+    align-items: baseline;
+  }
+  .verdict-row dt {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    color: var(--ink-soft);
+  }
+  .verdict-row dd { margin: 0; font-size: 16px; }
+  .verdict-row dd b { font-weight: 700; }
+  .stop { color: var(--sev-crit); }
+  .clear { color: var(--ok); }
+
+  /* ---------- tally ---------- */
+
+  .tally {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 12px;
+    margin: 0 0 30px;
+  }
+  .tally-cell {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    padding: 16px 16px 14px;
+    border-top-width: 3px;
+  }
+  .tally-cell .n {
+    font-family: var(--mono);
+    font-size: 30px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    display: block;
+  }
+  .tally-cell .k {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-top: 8px;
+    display: block;
+  }
+  .t-crit { border-top-color: var(--sev-crit); } .t-crit .n { color: var(--sev-crit); }
+  .t-high { border-top-color: var(--sev-high); } .t-high .n { color: var(--sev-high); }
+  .t-med  { border-top-color: var(--sev-med);  } .t-med .n  { color: var(--sev-med); }
+  .t-low  { border-top-color: var(--sev-low);  } .t-low .n  { color: var(--sev-low); }
+
+  /* ---------- measured block ---------- */
+
+  .measured {
+    border: 1px solid var(--rule-strong);
+    background: var(--surface);
+    padding: 24px 26px;
+    margin: 0 0 24px;
+  }
+  .measured h3 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 16px;
+  }
+  .readout { display: flex; flex-direction: column; gap: 10px; }
+  .readout-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    align-items: baseline;
+    padding-bottom: 10px;
+    border-bottom: 1px dotted var(--rule);
+  }
+  .readout-row:last-child { border-bottom: 0; padding-bottom: 0; }
+  .readout-row .lbl { font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); }
+  .readout-row .val {
+    font-family: var(--mono);
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  .val.alarm { color: var(--sev-crit); font-weight: 700; }
+
+  /* ---------- findings ---------- */
+
+  .finding {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left-width: 4px;
+    padding: 24px 26px;
+    margin: 0 0 18px;
+  }
+  .f-crit { border-left-color: var(--sev-crit); }
+  .f-high { border-left-color: var(--sev-high); }
+  .f-med  { border-left-color: var(--sev-med); }
+
+  .f-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 4px 9px;
+    border-radius: 2px;
+    font-weight: 700;
+  }
+  .c-crit { background: var(--sev-crit-bg); color: var(--sev-crit); }
+  .c-high { background: var(--sev-high-bg); color: var(--sev-high); }
+  .c-med  { background: var(--sev-med-bg);  color: var(--sev-med); }
+  .c-low  { background: var(--sev-low-bg);  color: var(--sev-low); }
+  .f-id { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); letter-spacing: 0.06em; }
+
+  .finding h3 {
+    font-family: var(--display);
+    font-size: 21px;
+    font-weight: 400;
+    line-height: 1.28;
+    margin: 0 0 10px;
+    text-wrap: balance;
+  }
+  .loc {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+    margin: 0 0 16px;
+    word-break: break-word;
+  }
+  .finding p { font-size: 16px; margin: 0 0 14px; }
+  .finding p:last-child { margin-bottom: 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.87em;
+    background: var(--surface-sunk);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    background: var(--surface-sunk);
+    border: 1px solid var(--rule);
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 0 0 16px;
+  }
+  pre code { background: none; padding: 0; }
+
+  .scenario {
+    background: var(--surface-sunk);
+    border-left: 2px solid var(--rule-strong);
+    padding: 14px 18px;
+    margin: 0 0 16px;
+    font-size: 15px;
+  }
+  .scenario p { font-size: 15px; }
+  .scenario .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    display: block;
+    margin-bottom: 8px;
+  }
+
+  .tbl-scroll { overflow-x: auto; margin: 0 0 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td {
+    text-align: left;
+    padding: 8px 14px 8px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 400;
+  }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.hot { color: var(--sev-crit); font-weight: 700; }
+
+  /* ---------- low list ---------- */
+
+  ul.lows { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  ul.lows li { background: var(--surface); padding: 13px 18px; font-size: 15px; }
+  ul.lows li b { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); font-weight: 400; margin-right: 8px; letter-spacing: 0.05em; }
+
+  /* ---------- ordered fix list ---------- */
+
+  ol.order { list-style: none; counter-reset: fix; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 14px; }
+  ol.order li {
+    counter-increment: fix;
+    display: grid;
+    grid-template-columns: 40px 1fr;
+    gap: 16px;
+    align-items: start;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 16px 18px;
+  }
+  ol.order li::before {
+    content: counter(fix);
+    font-family: var(--mono);
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    color: var(--surface);
+    background: var(--accent);
+    width: 26px; height: 26px;
+    display: grid; place-items: center;
+    border-radius: 50%;
+  }
+  ol.order li p { margin: 0; font-size: 15.5px; }
+  ol.order li p + p { margin-top: 6px; color: var(--ink-soft); font-size: 14.5px; }
+
+  .sound { columns: 2 260px; column-gap: 34px; font-size: 15px; color: var(--ink-soft); }
+  .sound p { break-inside: avoid; margin-bottom: 14px; }
+  .sound b { color: var(--ink); font-weight: 700; }
+
+  footer {
+    margin-top: 72px;
+    padding-top: 22px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+
+  @media (max-width: 620px) {
+    body { font-size: 16px; padding: 0 18px 64px; }
+    .verdict-row { grid-template-columns: 1fr; gap: 6px; }
+    .sound { columns: 1; }
+    ol.order li { grid-template-columns: 30px 1fr; gap: 12px; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Internal review · Soroban contracts</p>
+    <h1>Sidereal Contract Audit</h1>
+    <p class="standfirst">Two launch blockers, six high-severity findings, and a settled question about revenue: there wasn't any. All eight are now fixed and tested. The fee has plumbing and a default of zero — the number is still yours to choose, and only until the first V2 deployment.</p>
+    <div class="meta">
+      <div>Date<span>18 Aug 2026</span></div>
+      <div>Tree<span>784528f + V2 seam</span></div>
+      <div>Contracts<span>8 reviewed</span></div>
+      <div>Test suite<span>153 pass / 0 fail</span></div>
+    </div>
+  </header>
+
+  <section>
+    <h2>Verdict</h2>
+    <p class="section-note">By area</p>
+    <dl class="verdict">
+      <div class="verdict-row">
+        <dt>V1 SY wrapper</dt>
+        <dd><b class="clear">Sound.</b> No fund-loss vector, no admin drain. One TTL deadline in November.</dd>
+      </div>
+      <div class="verdict-row">
+        <dt>Tokenizer / PT / YT</dt>
+        <dd>Solvency holds under a rising rate. <b class="stop">Broken by H4</b> under a rate dip.</dd>
+      </div>
+      <div class="verdict-row">
+        <dt>AMM</dt>
+        <dd><b class="stop">Not safe to seed with third-party liquidity.</b> C1, H1, H2, H3.</dd>
+      </div>
+      <div class="verdict-row">
+        <dt>V2 vault + seam</dt>
+        <dd><b class="stop">Not safe to deploy.</b> C2 is a launch blocker.</dd>
+      </div>
+      <div class="verdict-row">
+        <dt>Revenue</dt>
+        <dd>Zero, by construction, everywhere. Decision window closes at first V2 <code>initialize</code>.</dd>
+      </div>
+    </dl>
+
+    <p style="margin-top:26px"><strong>The passing test suite is not evidence of correctness for anything below.</strong> Two of the most severe findings are invisible to it by construction: the AMM property tests are pinned to an SY rate of exactly 1.0, where C1 vanishes identically, and the economics random-sequence test only ever moves the rate upward, which is the one direction H4 cannot fire in.</p>
+  </section>
+
+  <section>
+    <h2>Remediation</h2>
+    <p class="section-note">Same day · all uncommitted</p>
+    <p>Every critical and high finding is fixed, each with a test that fails without the fix. Status is <em>fixed</em> only where a test proves it; <em>documented</em> means the code was already right and the claim about it was wrong.</p>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Finding</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td class="num">C1</td><td>Curve prices PT face against raw shares</td><td>fixed — asset-denominated curve, ceil-in/floor-out at the boundary</td></tr>
+          <tr><td class="num">C2</td><td>Vault rate inflatable by a transfer</td><td>fixed — idle excluded, plus a permanent minimum-share lock</td></tr>
+          <tr><td class="num">H1</td><td>YT routes break above ~1.005</td><td>fixed — falls out of C1; solver rebuilt</td></tr>
+          <tr><td class="num">H2</td><td>SY-in swaps keep the unspent budget</td><td>fixed — only the priced amount is charged</td></tr>
+          <tr><td class="num">H3</td><td>TWAP settable by trade-and-reverse</td><td>fixed — weights the rate that actually prevailed</td></tr>
+          <tr><td class="num">H4</td><td>Transfer during a dip re-opens paid yield</td><td>fixed — per-holder yield basis in shares</td></tr>
+          <tr><td class="num">H5</td><td><code>max_withdraw</code> counts undeliverable idle</td><td>fixed — withdraw pays from idle first</td></tr>
+          <tr><td class="num">H6</td><td>Full burn on a short delivery</td><td>fixed — proportional burn, ceil</td></tr>
+          <tr><td class="num">M2</td><td>Keeper blind to mainnet</td><td>fixed — plus two latent keeper bugs found while fixing it</td></tr>
+          <tr><td class="num">M3</td><td>Bytecode unreproducible from its commit</td><td>fixed — untracked contract source refused outright</td></tr>
+          <tr><td class="num">M5</td><td>No fee anywhere</td><td>plumbing fixed; <strong>rate is yours to choose</strong></td></tr>
+          <tr><td class="num">M9</td><td><code>deposit_cap</code> decorative</td><td>fixed — enforced and applied at deploy</td></tr>
+          <tr><td class="num">M1</td><td>Freeze pins a stale observation</td><td>closed — won't fix; code correct as designed, affected market retired</td></tr>
+          <tr><td class="num">M8</td><td>SY not SEP-41 conformant</td><td>open — V1 immutable; carry into V2</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:20px">M4, M7, M10, L2, L8, L13 and L14 are also fixed; M6 and M11 are documented; the remaining low findings are recorded and none are fund-affecting. Full detail in <code>docs/audit/2026-08-internal-audit.md</code>.</p>
+
+    <div class="measured" style="margin-top:26px">
+      <h3>The V1 pilot is retired, not remediated</h3>
+      <p style="margin:0 0 14px">Decision of 18 August: the mainnet pilot is written off rather than wound down. It matured on 9 August having proven what it existed to prove — five immutable contracts, real funds, a full lifecycle on mainnet — and V2 deploys at new addresses regardless. Its manifest is marked retired and the keeper skips it, so it will not report upkeep nobody intends to perform. That closes M1 and the November archival deadline as <em>accepted</em> rather than fixed: the maturity rate can no longer be improved, and roughly $10.70 is involved, 96% of it the deployer's own position on both sides.</p>
+      <p style="margin:0"><strong>The keeper fixes still matter</strong>, because two of the three bugs found while making it see that market were not mainnet-specific: a failed contract read scored as a satisfied invariant, and PT coverage was checked against the live rate rather than the settlement rate. Both applied to V2 markets too.</p>
+    </div>
+
+    <div class="measured" style="margin-top:18px">
+      <h3>The one irreversible decision left</h3>
+      <p style="margin:0"><strong>The fee needs a number, and only before the first V2 <code>initialize</code>.</strong> <code>yield_fee_bps</code> and <code>fee_recipient</code> are now config fields fixed at initialization, with no setter, a 20% ceiling enforced in the wasm, and the skim taken from the PT-senior-capped surplus. Deploy scripts default to <strong>0 bps</strong>, so nothing charges anything until someone decides it should. Peer protocols sit around 3–5% of claimed yield. Everything else in this report can be revised later; this one closes at that transaction.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Findings</h2>
+    <p class="section-note">Twenty-three total · as originally reported</p>
+    <div class="tally">
+      <div class="tally-cell t-crit"><span class="n">2</span><span class="k">Critical</span></div>
+      <div class="tally-cell t-high"><span class="n">6</span><span class="k">High</span></div>
+      <div class="tally-cell t-med"><span class="n">11</span><span class="k">Medium</span></div>
+      <div class="tally-cell t-low"><span class="n">14</span><span class="k">Low</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Measured on mainnet</h2>
+    <p class="section-note">Read-only simulation · 17 Aug 2026</p>
+    <p>The live market matured on 9 August and was never settled. These are not inferences — they were read off the contracts.</p>
+    <div class="measured">
+      <h3>Tokenizer · CBMB52N4…EHBX</h3>
+      <div class="readout">
+        <div class="readout-row"><span class="lbl">is_matured()</span><span class="val">true</span></div>
+        <div class="readout-row"><span class="lbl">maturity_rate()</span><span class="val alarm">0 — never frozen</span></div>
+        <div class="readout-row"><span class="lbl">freeze_maturity_rate() simulated</span><span class="val">1.000131105127269445</span></div>
+        <div class="readout-row"><span class="lbl">sy.exchange_rate() live</span><span class="val">1.007631141108698867</span></div>
+        <div class="readout-row"><span class="lbl">escrow / PT supply / YT supply</span><span class="val">50,796,162 / 50,798,215 / 50,798,215</span></div>
+      </div>
+    </div>
+    <p>The value the freeze would pin implies the last rate observation dates from around 11 July, a day after deployment. Settlement will therefore pay YT roughly 4,600 stroops against a true accrual near 30,000 — about two percent — with the remainder flowing to PT holders, who are supposed to receive a fixed face and nothing more.</p>
+    <p><strong>This is already unrecoverable.</strong> <code>observe_rate</code> is gated on a live market, so no better observation can be recorded now; the frozen value is locked in whether you freeze today or never. The design is sound in one important respect — the freeze deliberately refuses to read a live post-maturity rate, so freeze <em>timing</em> cannot move value and delay costs nothing further.</p>
+    <p>Scale matters for calibration: the entire market is about $10.70, the deployer key holds 96% of the YT, and the AMM holds 96% of the PT as liquidity. The misdirected yield is a fraction of a cent moving largely between the operator's own positions. The damage is to the evidence, not the treasury — and evidence was the reason the pilot existed.</p>
+  </section>
+
+  <section>
+    <h2>Critical</h2>
+    <p class="section-note">Blocks deployment</p>
+
+    <article class="finding f-crit">
+      <div class="f-head"><span class="chip c-crit">Critical</span><span class="f-id">C1 · AMM</span></div>
+      <h3>The curve prices asset-denominated PT face against raw SY shares</h3>
+      <p class="loc">contracts/amm/src/lib.rs:799 — <code>let total_asset = state.total_sy;</code></p>
+      <p><code>total_pt</code> is PT face in asset units, but <code>total_asset</code> is assigned raw SY <em>shares</em> with no index conversion. The curve enforces a rate floor and decays toward 1 at maturity, so the pool converges to “1 PT face = 1 SY share” while the tokenizer redeems PT at <code>face × WAD / R</code> shares. Anyone can mint PT for <code>1/R</code> shares and sell it to the pool for roughly <code>1/e</code>. Profit is riskless whenever <code>e &lt; R</code>.</p>
+      <div class="tbl-scroll">
+        <table>
+          <thead><tr><th>SY rate R</th><th>t−30d</th><th>t−15d</th><th>t−1h</th></tr></thead>
+          <tbody>
+            <tr><td class="num">1.0063</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+            <tr><td class="num">1.02</td><td class="num">0.047%</td><td class="num">0.094%</td><td class="num">1.101%</td></tr>
+            <tr><td class="num">1.05</td><td class="num">0.502%</td><td class="num">0.950%</td><td class="num hot">3.633%</td></tr>
+            <tr><td class="num">1.10</td><td class="num">2.066%</td><td class="num">3.479%</td><td class="num hot">7.546%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Figures are the profit of a single optimal trade as a percentage of the pool's entire SY reserve, on the deployed configuration.</p>
+      <p>This is tracked as M6 in <code>findings.md</code> and marked “accepted for v1” — <strong>but the accepted bound is wrong in a way that matters.</strong> The stated bound is “30 days of accrual ≈ 0.66%”. The real break-even is <code>e &lt; R</code>, where <code>R</code> is the SY wrapper's <em>cumulative</em> appreciation since its own inception, not the market's term. A wrapper reused across a series of maturities carries all prior accrual forward: after a year at 8%, the first 30-day market minted on it opens with a standing 2–7% arbitrage against LPs regardless of its own term. The bound is <code>1 − e/R</code>.</p>
+      <p>Realized loss is zero so far only because no third party ever traded the mainnet pool. Seeding V2 liquidity before fixing this converts it from theoretical to realized.</p>
+    </article>
+
+    <article class="finding f-crit">
+      <div class="f-head"><span class="chip c-crit">Critical</span><span class="f-id">C2 · V2 vault</span></div>
+      <h3>The vault's exchange rate can be inflated by a plain token transfer</h3>
+      <p class="loc">strategy-blend:355-362, :335-337 · sy-vault-v2:704-712 · strategy-interface:109-114</p>
+      <p><code>assets_of</code> is <code>idle_balance + supplied_assets</code>, where <code>idle_balance</code> is the strategy contract's <em>raw token balance</em>. The vault derives its rate from that with no virtual-share offset, no dead shares, and no minimum liquidity. <strong>Any address can raise the exchange rate by sending underlying to the strategy with an ordinary transfer</strong> — no auth, no deposit call, no interaction with the vault at all.</p>
+      <div class="scenario">
+        <span class="tag">First-depositor exploit · stroops</span>
+        <p>Attacker deposits 1 → owns the only share. Attacker transfers 4,999,999,999 directly to the strategy → rate becomes 5e27. Victim deposits 9,999,999,999 → receives <strong>1 share</strong> (non-zero, so the <code>shares &lt;= 0</code> guard never fires). Attacker redeems → 7,499,999,999. <strong>Net +249.99 USDC on a 500.00 outlay; victim recovers ~250 of 1000.</strong></p>
+      </div>
+      <p><code>min_sy_out</code> is not a defense: <code>preview_deposit</code> divides by the same poisoned rate, and the SDK defaults the bound to <code>0n</code>.</p>
+      <p><strong>The vector reaches through the vault into the tokenizer.</strong> The PT-senior reservation is <code>ceil(pt_supply × WAD / rate)</code>, so a <em>higher</em> rate shrinks it and releases escrowed SY to YT claimants. A YT holder can donate to inflate the rate, claim the released escrow, and redeem it for the donation back — leaving PT under-covered for the cost of gas. That is the <code>#9 Insolvent</code> failure mode re-entering through a door the design did not anticipate.</p>
+      <p><strong>V1 is immune and V2 regressed.</strong> The V1 wrapper values only the bToken position; its <code>underlying_balance</code> exists as a separate function and is deliberately excluded from AUM. Removing the admin rate-setter closed one path to an attacker-influenced rate; counting idle balance opened another to the same place. Exposure today is testnet only.</p>
+    </article>
+  </section>
+
+  <section>
+    <h2>High</h2>
+    <p class="section-note">Six findings</p>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H1 · AMM</span></div>
+      <h3>Both YT flash routes break once the SY rate exceeds ~1.005</h3>
+      <p class="loc">contracts/amm/src/lib.rs:457-465 (sell) · :1008-1041 (buy solver)</p>
+      <p>The second half of C1. The flash routes <em>do</em> perform the face-to-share conversion, which is precisely why they are inconsistent with the index-blind curve.</p>
+      <p><strong>Sell side:</strong> the route requires <code>e &gt; R·(1+fee)</code>. At the deployed anchor that threshold is <code>R &gt; 1.0053</code>. Once the wrapper has accrued about half a percent, <em>no one can ever sell YT</em>, and the quote errors for every input. Not size-dependent. As maturity nears, the threshold falls further.</p>
+      <p><strong>Buy side:</strong> the solver binary-searches assuming the feasible set is a prefix, but above R = 1 it is an interior interval. When the first probe lands below it, the search discards everything above and returns dust — while keeping the user's input.</p>
+      <div class="tbl-scroll">
+        <table>
+          <thead><tr><th>sy_in</th><th>yt_out</th><th>SY used</th><th>Kept by pool for nothing</th></tr></thead>
+          <tbody>
+            <tr><td class="num">1.00</td><td class="num">0.0000003</td><td class="num">0.0000001</td><td class="num hot">0.9999999 (100%)</td></tr>
+            <tr><td class="num">100.00</td><td class="num">920.00 (capped)</td><td class="num">67.79</td><td class="num hot">32.21 (32%)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The quote function runs the identical solver, so a client deriving <code>min_yt_out</code> from the quote passes its own check and still loses everything. The code comment anticipates non-monotonicity but concludes the result “can only be suboptimal for the buyer”; a total loss of principal is not suboptimality.</p>
+    </article>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H2 · AMM</span></div>
+      <h3>SY-in swaps keep the full input when the trade is liquidity-capped</h3>
+      <p class="loc">contracts/amm/src/lib.rs:390, :432, :920, :882-904</p>
+      <p>The solver returns the largest <code>pt_out</code> affordable within <code>sy_in</code>, and execution only rejects the case where the cost <em>exceeds</em> the input. Nothing checks that the cost is close to it, and the surplus is absorbed into reserves as an LP donation. Independent of C1 — this reproduces at a rate of exactly 1.0.</p>
+      <p>The rate floor caps a single PT purchase at 7.65% of the PT reserve at market open, so the cap binds early and ordinary order sizes are affected:</p>
+      <div class="tbl-scroll">
+        <table>
+          <thead><tr><th>sy_in</th><th>pt_out</th><th>Required SY</th><th>Donated to LPs</th></tr></thead>
+          <tbody>
+            <tr><td class="num">100</td><td class="num">76.50</td><td class="num">76.58</td><td class="num hot">23.42 (23.4%)</td></tr>
+            <tr><td class="num">200</td><td class="num">76.50</td><td class="num">76.58</td><td class="num hot">123.42 (61.7%)</td></tr>
+            <tr><td class="num">500</td><td class="num">76.50</td><td class="num">76.58</td><td class="num hot">423.42 (84.7%)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>AUDIT.md</code> characterizes this as “dust accrues to LPs”. It is not dust and it is not bounded. <code>min_pt_out</code> does not defend against it, because the quote returns the same capped <code>pt_out</code>. The fix is a refund of the residual, not a tighter minimum.</p>
+    </article>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H3 · AMM</span></div>
+      <h3>One atomic trade-and-reverse sets the TWAP to an arbitrary value</h3>
+      <p class="loc">contracts/amm/src/lib.rs:1121-1147 (<code>sync_twap</code>)</p>
+      <p>The accumulator blends the <em>post-trade</em> rate in with weight <code>elapsed / window</code> — but <code>elapsed</code> is the interval during which the <em>pre-trade</em> rate was actually in effect. A correct accumulator weights the previous rate over the elapsed interval. Compounding it, a zero elapsed time returns early, so a same-ledger reversal is free, and the warm-up re-entry does not fire one second below the window.</p>
+      <div class="scenario">
+        <span class="tag">Attack · 1800s window</span>
+        <p>Wait until 1799s after the last trade — an idle market is the normal case. In one transaction: swap 100 PT for SY, moving spot implied APY from 764 to 1748 bps at weight 0.99944, so the TWAP becomes ≈1747 bps and <code>twap_warming_up()</code> stays false. Then reverse at the same timestamp: elapsed is zero, the TWAP is untouched, spot is restored. <strong>Cost: 1.01 SY on a 1000-SY pool — 0.10%.</strong> 300 PT reaches 3736 bps for 0.8%.</p>
+      </div>
+      <p>The architecture document markets this TWAP to external lending protocols as manipulation-resistant collateral pricing, citing the February 2026 YieldBlox oracle exploit. At these costs that claim does not hold. Fixing it needs a real cumulative-price accumulator, not a patch to the zero-elapsed branch.</p>
+    </article>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H4 · YT token</span></div>
+      <h3>A YT transfer during a rate dip re-opens an already-paid yield interval</h3>
+      <p class="loc">contracts/yt-token/src/lib.rs:438-447, specifically :441-444</p>
+      <pre><code>let last = match Self::read_checkpoint(env, holder) {
+    Some(c) =&gt; c,
+    None =&gt; { Self::write_checkpoint(env, holder, rate); return; }
+};
+if rate &lt;= last { return; }   // high-water hold, correct for existing holders</code></pre>
+      <p>The checkpoint is correctly held as a high-water mark for an <em>existing</em> holder on a dip, but a receiver with <em>no</em> checkpoint is initialized to the current, dipped rate. Transferring YT to a fresh address during a dip resets that YT's high-water mark downward and makes the sender's already-paid interval claimable a second time.</p>
+      <div class="scenario">
+        <span class="tag">Reproduced against the integration harness</span>
+        <p>Alice splits at rate 1.00; rate rises to 1.10; she claims 90,909,090 and her checkpoint advances. Rate regresses to 1.05 and Carol splits a fresh, fully-funded position. Alice transfers her paid-up YT to a fresh address she controls, writing checkpoint 1.05. The rate merely returns to 1.10 — no new yield beyond what Alice was already paid — and <strong>two claims of 43,290,042 now stand against a surplus of 43,290,044</strong>. Bob claims first and takes it; Carol receives 2 stroops, and after PT redemption drains escrow her later claim returns 1. Carol's entire entitlement transfers to Bob.</p>
+      </div>
+      <p>The repo's own invariant fails on the same setup: <code>escrow 2047619048 must cover PT+YT claims 2095238091</code>. It is self-profitable and repeatable — claim at a peak, wait for a dip, self-transfer, claim again on recovery. The random-sequence test misses it because that test only ever bumps the rate upward, and M7 below shows the dip trigger is real rather than hypothetical.</p>
+    </article>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H5 · strategy-blend</span></div>
+      <h3><code>max_withdraw</code> counts idle underlying that <code>withdraw</code> can never deliver</h3>
+      <p class="loc">contracts/strategy-blend/src/lib.rs:153-167 vs :209-244</p>
+      <p><code>max_withdraw</code> returns <code>idle + min(supplied, pool_cash)</code> and its comment asserts that idle underlying is always realizable — but <code>withdraw</code> only measures the idle <em>delta</em> around the upstream call, so pre-existing idle is never paid out and is unreachable by any entrypoint. A strategy holding 100 USDC idle with a zero Blend position advertises it as realizable while every withdrawal reverts. There is no sweep and no rescue. Fixing this also turns any C2 donation from stranded-and-rate-poisoning into harmless-but-recoverable.</p>
+    </article>
+
+    <article class="finding f-high">
+      <div class="f-head"><span class="chip c-high">High</span><span class="f-id">H6 · V2 vault</span></div>
+      <h3>V2 burns the full share amount on a short delivery; V1 burned only what was delivered</h3>
+      <p class="loc">sy-vault-v2:395-417 vs sy-wrapper:571-584</p>
+      <p>V1 recomputes the burn from what actually arrived when a fill comes up short, so a partial withdrawal consumes only the SY it paid for. V2 burns the whole requested amount and accepts whatever arrives so long as it clears <code>min_underlying_out</code>. With the SDK's default of zero, a user redeeming 60 SY against a 50-USDC-realizable position <strong>burns 60 SY for 50 USDC</strong>, gifting the difference to remaining holders.</p>
+      <p>The code comment claims a short delivery “reverts the whole transaction, so there is no state in which SY is burned without the matching underlying arriving.” That holds only when the minimum is set tightly, which neither the SDK default nor the trait-level redeem does. The V1/V2 equivalence test misses it because it only exercises fully satisfiable redemptions.</p>
+    </article>
+  </section>
+
+  <section>
+    <h2>Medium</h2>
+    <p class="section-note">Selected — eleven total, full list in the repo</p>
+
+    <article class="finding f-med">
+      <div class="f-head"><span class="chip c-med">Medium</span><span class="f-id">M1 · Tokenizer</span></div>
+      <h3>The maturity freeze pins the last pre-maturity observation, so PT is paid above face</h3>
+      <p class="loc">contracts/tokenizer/src/lib.rs:565-583, :124-129</p>
+      <p>PT redeems shares valued at the frozen rate but worth the live rate, so a stale freeze hands PT more than its face, funded out of YT's yield. The exposure is the unobserved tail — and <strong>PT has no rate path at all</strong>, so PT↔SY swaps, the primary market, never refresh the observation. This is the finding measured live above.</p>
+    </article>
+
+    <article class="finding f-med">
+      <div class="f-head"><span class="chip c-med">Medium</span><span class="f-id">M2 · Operations</span></div>
+      <h3>The keeper structurally cannot see the mainnet market</h3>
+      <p class="loc">scripts/keeper.mjs:95-111, :224-236 · deployments/markets/</p>
+      <p>The keeper walks <code>deployments/markets/&lt;network&gt;/</code>, which contains only the two testnet markets. The mainnet market still lives in the legacy flat manifest, so the only automation that calls <code>observe_rate</code> and <code>freeze_maturity_rate</code> has never looked at it — the root cause of M1. Its TTL duty also calls <code>sy.touch()</code>, which exists only on the V2 vault, not the deployed V1 wrapper.</p>
+      <p>The same failure hit testnet: the short market matured on 16 August and is also unfrozen. That was the explicit dated gate in the V2 plan — “the keeper runs unattended across the 2026-08-16 maturity and freezes the rate without human intervention.” Nothing schedules it; CI has no cron.</p>
+      <p><strong>Measured TTL:</strong> the vault instance entry and Blend's positions entry expire at ledgers 65,488,004 and 65,489,595 — both around <strong>11 November 2026</strong>. The manifest's “no renewal needed for a one-shot cycle” holds only if funds exit first. Funds aren't lost if they lapse, but the app offers no restore path.</p>
+    </article>
+
+    <article class="finding f-med">
+      <div class="f-head"><span class="chip c-med">Medium</span><span class="f-id">M3 · Deploy</span></div>
+      <h3>Deployed testnet bytecode cannot be reproduced from the commit it claims</h3>
+      <p class="loc">scripts/deploy-market.sh:177</p>
+      <pre><code>dirty="$(git status --porcelain --untracked-files=no)"</code></pre>
+      <p>The flag excludes untracked files from the dirty check, so the entire V2 contract source — all three crates, still untracked — sails through the “tracked source is dirty” gate. The script then stamps <code>HEAD</code> into the manifest as provenance. Both V2 manifests claim a commit that contains none of the contracts they deployed. This is the same class of problem the superseded audit flagged historically, recurring in new code.</p>
+    </article>
+
+    <article class="finding f-med">
+      <div class="f-head"><span class="chip c-med">Medium</span><span class="f-id">M5 · Economics</span></div>
+      <h3>There is no fee anywhere, and V2 is immutable, so the decision must precede deploy</h3>
+      <p class="loc">amm:837, :967, :993 · sy-vault-v2:43-46, :143</p>
+      <p>The only fee in the protocol is the AMM's 10 bps swap fee, retained in reserves and reconciled into LP value. Every other path charges zero. Searching the whole repository for a treasury, fee recipient, protocol fee, or collector returns no hits in any contract, and there is no sweep or skim entrypoint. The live mainnet AMM config, read on-chain, is <code>{admin, fee_bps: 10, initial_anchor, maturity, pt_token, scalar_root, sy_token, tokenizer, twap_window, yt_token}</code> — <strong>there is no fee-recipient field to point anywhere.</strong></p>
+      <p>The V2 vault “exposes no admin entrypoint at all”, and the code matches: <code>admin</code> is written once and never read again. No contract has an upgrade entrypoint. <strong>A fee cannot be retrofitted to a deployed V2 market</strong>; it must be compiled in and set at <code>initialize</code>. Since the AMM is being redeployed anyway for C1, that redeploy is the free window.</p>
+      <p>The clean insertion point is the tokenizer's yield claim, skimming from <code>pay</code> — the value <em>after</em> the PT-senior cap:</p>
+      <pre><code>let pay = if owed &lt; surplus { owed } else { surplus };   // existing :394
+let fee = mul_div_floor(&amp;env, pay, config.yield_fee_bps, BPS)?;
+consume_yt(&amp;env, &amp;config.yt_token, &amp;holder, pay);        // consume gross
+push_token(&amp;env, &amp;config.sy_token, &amp;holder, pay - fee);
+push_token(&amp;env, &amp;config.sy_token, &amp;config.fee_recipient, fee);</code></pre>
+      <p>Because <code>pay</code> is already the junior surplus, the fee structurally cannot reach the PT reservation — PT stays senior to the protocol fee for free. SY moves between escrow and the recipient without changing total assets or total supply, so the derived rate is provably untouched. Roughly fifteen lines. Taking it from <code>owed</code> instead would make the protocol compete with YT holders during a shortfall.</p>
+      <p><strong>Do not</strong> implement a yield fee as periodic share dilution or an asset skim: both step the exchange rate down, and the tokenizer reads a rate decline as a strategy slash. And keep the sizing in perspective — at $1M TVL and 8% APY a 3–5% performance fee earns roughly $2.4–4k a year, which C1 leaks in a single arbitrage.</p>
+    </article>
+
+    <article class="finding f-med">
+      <div class="f-head"><span class="chip c-med">Medium</span><span class="f-id">M7 · Blend adapter</span></div>
+      <h3>The “rate is monotonic” invariant is asserted in comments and tests but is false</h3>
+      <p class="loc">contracts/blend-adapter/src/lib.rs:136-139, test at :196-206</p>
+      <p>The comment claims a Blend position's value “only rises with accrued interest… no admin can lower it, which is the whole point”, and the monotonicity test is documented as the property that makes <code>#9</code> impossible. But Blend v2 socializes bad debt by <em>decreasing</em> <code>b_rate</code>, reachable through a <strong>permissionless</strong> pool entrypoint that fires when the backstop is drained, and it hits plain supply positions too.</p>
+      <p>The wrapper itself handles a decline correctly and stays solvent. The risk is downstream — YT rejects a rate below its checkpoint and the AMM has its own floors, so a dip can halt claims and quotes. It is also the trigger that turns H4 from a rounding-notch leak into a large one.</p>
+    </article>
+
+    <p style="margin-top:26px">Also at medium: <strong>M4</strong>, re-using an address forfeits yield on newly acquired YT (the mirror of H4, same one-line fix); <strong>M6</strong>, the YT routes charge the fee on leveraged PT face, so a “10 bps” pool takes 1.6–5% of a YT buyer's capital while the docs advertise 0.3%; <strong>M8</strong>, SY is a live mainnet token that is not SEP-41 conformant and emits no events at all, so wallets and explorers see every balance as zero; <strong>M9</strong>, <code>deposit_cap</code> appears in every manifest and is read by no contract; <strong>M10</strong>, the two Blend-custody error codes are unmapped in the frontend, so a redemption failure renders as a bare number; and <strong>M11</strong>, the live admin is the transient deploy key rather than the mobile wallet the deployment plan designated.</p>
+  </section>
+
+  <section>
+    <h2>Low</h2>
+    <p class="section-note">Fourteen — recorded so they are not re-derived</p>
+    <ul class="lows">
+      <li><b>L1</b>Every contract's <code>initialize</code> is front-runnable; deploy and init are separate transactions and there is no constructor.</li>
+      <li><b>L2</b>The PT→SY fee floors to zero under 1000 stroops. Verified <em>not</em> drainable — round trips lose at least a stroop even at zero fee.</li>
+      <li><b>L3</b><code>preview_claim_yield</code> over-quotes post-maturity before the freeze, falling back to the one rate the freeze exists to never use.</li>
+      <li><b>L4</b><code>owed_shares</code> is the one value path not hardened to I256, and overflow panics rather than returning an error.</li>
+      <li><b>L5</b><code>maturity</code> is stored three times with no cross-check; only the deploy script keeps them equal.</li>
+      <li><b>L6</b>Deposit can over-credit by ≤1 stroop from double-flooring the AUM delta. Economically unreachable.</li>
+      <li><b>L7</b>No minimum-out parameters on V1 deposit or redeem; a composing contract has no floor.</li>
+      <li><b>L8</b>The unreachable partial-fill branch rounds the wrong way; should ceil. Recorded so V2 doesn't inherit it.</li>
+      <li><b>L9</b>Underlying sent directly to the V1 vault is permanently stranded — no sweep, no admin rescue.</li>
+      <li><b>L10</b>The last redeemer strands a few stroops in Blend, which become a windfall for a next depositor who will never arrive.</li>
+      <li><b>L11</b>BLND emissions on the supply reserve would be unclaimable. Verified not currently configured, so nothing is being lost.</li>
+      <li><b>L12</b><code>strategy-blend</code> returns <code>NotVault</code> for an admin-auth failure; the error enum has no <code>NotAuthorized</code>.</li>
+      <li><b>L13</b>A dead authorization entry in the AMM's flash recombine is never matched.</li>
+      <li><b>L14</b><code>zap_out_at_maturity</code> is documented in the architecture but exists in no contract and no SDK path.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Fix order</h2>
+    <p class="section-note">The sequence that was followed · steps 1–4 and 7 are done</p>
+    <ol class="order">
+      <li>
+        <div>
+          <p><strong>C2 and H5 together</strong> — same code area.</p>
+          <p>Kill the donation vector and make idle payable in <code>withdraw</code>. Add the first-depositor and direct-donation tests the multi-strategy plan already names as required, <em>before</em> the fix, so it is proven rather than asserted.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>C1 and H1 together</strong> — one root cause, one fix.</p>
+          <p>Value the SY reserve at the index inside the curve and convert outputs back to shares. Re-run the property suite at rates 1.0, 1.01, 1.05 and 1.1 across the plain legs <em>and</em> both YT routes; the existing 10,000-case suite is pinned where the defect vanishes. <code>scripts/amm-curve-model.py</code> is the bit-exact model behind the figures above.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>H4 and M4</strong> — one line, plus a test arm.</p>
+          <p>Initialize a receiver's checkpoint to the greater of the current rate and the sender's, or move to a global yield index. Add a rate-<em>regression</em> arm to the random-sequence test.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>H2, H3 and H6</strong> — independent and individually cheap.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>Register mainnet with the keeper and schedule it.</strong></p>
+          <p>Teach it the V1 fallback and set a hard alarm at ledger 65,000,000 (~14 Oct) if funds will remain past October. Cleanest alternative: wind the mainnet market down — it matured nine days ago and holds $10.70, and redeeming closes M2, L10 and L11 outright.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>Decide the fee before the first V2 <code>initialize</code>.</strong></p>
+          <p>It is unmakeable afterward.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>Fix the provenance gate and commit the V2 seam</strong> so the manifests' claims become true.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <p><strong>Reconcile the docs with the code.</strong></p>
+          <p>The YT fee rate, the “open” fee-distribution question that shipped a month ago, the TWAP manipulation-resistance claim, the missing zap function, the monotonicity claim, the TTL note, the recorded admin key, and a stale remediation checkbox.</p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Verified sound</h2>
+    <p class="section-note">Checked and clean — listed so they are not re-audited</p>
+    <div class="sound">
+      <p><b>The V1 admin is powerless.</b> <code>set_exchange_rate</code> is permanently dead, gated on the pool being configured, and the live config reaches that gate. The pool can never be unset and re-initialization is blocked. The <code>#9 Insolvent</code> root cause is structurally fixed, not merely deprecated.</p>
+      <p><b>Reserve migration is a proven no-op.</b> It takes no index parameter, re-derives from the pool, and accepts only the same underlying — and Blend v2 reserve indices are immutable, so the brick it exists to recover from cannot occur.</p>
+      <p><b>No accrual-timing theft on deposit.</b> Blend accrues in memory on load without storing, and Soroban's ledger timestamp is constant within a transaction — verified empirically with two reads 78 seconds apart.</p>
+      <p><b>Illiquidity fails closed.</b> A Blend shortfall is a hard revert, not a partial fill, and no pool status blocks a plain withdraw. Blend's admin cannot freeze the vault's exit, and plain supply is not seizable in a liquidation.</p>
+      <p><b>Tokenizer solvency holds</b> under a non-decreasing rate. The PT-senior reservation is computed before payout, against a fresh rate, and rounds up so PT is never shorted by a notch. Split-then-recombine is strictly lossy in both directions, so tiny round trips cannot mint value.</p>
+      <p><b>Privileged entrypoints are properly gated.</b> Mint, settle, consume and burn all require the tokenizer's own frame, which no external caller can produce. Every self-authorization is argument-pinned with empty sub-invocations.</p>
+      <p><b>AMM round trips always lose.</b> Eleven sizes across two fee settings: every round trip loses at least a stroop, because both directions price the whole lot at the post-trade endpoint rate.</p>
+      <p><b>No quote/execute mismatch and no fee bypass.</b> All four quotes call the identical helpers as execution, and synthesizing PT via split costs the same single fee as buying it directly.</p>
+      <p><b>LP mechanics are sound.</b> Share invariants hold, first-LP inflation strictly loses money for the attacker, and post-maturity <code>remove_liquidity</code> deliberately still works — which matters now, since 96% of mainnet PT sits in the pool.</p>
+      <p><b>The V2 seam's stated rules are real</b> where they aren't undermined by C2: no rate setter anywhere, measured deltas rather than requested amounts, immutable bindings, permissionless <code>touch</code>, argument-pinned auth trees, and rounding that favors the vault on both sides.</p>
+      <p><b>CI has a wasm float-opcode gate</b>, globbed so new contracts are covered automatically, plus reproducible-build and registry-drift checks. It does not schedule the keeper.</p>
+    </div>
+  </section>
+
+  <footer>
+    Sidereal internal contract audit · 18 August 2026<br>
+    Static review of 8 Soroban contracts, deploy and keeper scripts, plus read-only simulation against live mainnet and testnet RPC.<br>
+    Quantitative AMM figures produced with a bit-exact reimplementation of the curve math: <code>scripts/amm-curve-model.py</code>.<br>
+    No code was modified and no transaction was submitted. Full report: <code>docs/audit/2026-08-internal-audit.md</code>.
+  </footer>
+</div>

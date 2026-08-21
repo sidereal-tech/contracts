@@ -136,7 +136,7 @@ log "Initializing YT token"
 invoke "$YT" initialize --admin "$ADMIN" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY"
 
 log "Initializing tokenizer"
-invoke "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY"
+invoke "$TK" initialize --admin "$ADMIN" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" --fee_recipient "$ADMIN" --yield_fee_bps "${YIELD_FEE_BPS:-0}"
 
 log "Initializing AMM"
 invoke "$AMM" initialize \

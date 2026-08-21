@@ -16,6 +16,18 @@ const LEDGERS_PER_DAY: u32 = 17_280;
 const TTL_THRESHOLD_LEDGERS: u32 = 30 * LEDGERS_PER_DAY;
 const TTL_EXTEND_TO_LEDGERS: u32 = 120 * LEDGERS_PER_DAY;
 
+/// Basis-point denominator for `yield_fee_bps`.
+const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Hard ceiling on the protocol's cut of claimed yield, enforced at
+/// initialization. The fee is immutable once set, so this bound is the only
+/// protection a depositor has against a mis-set market — and because it is
+/// checked in the wasm rather than in a deploy script, it holds for every
+/// market anyone ever deploys from this code. 20% is well above the 3-5% that
+/// comparable protocols charge, and far below a level that would make YT
+/// pointless.
+const MAX_YIELD_FEE_BPS: i128 = 2_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct Config {
@@ -24,6 +36,19 @@ pub struct Config {
     pub pt_token: Address,
     pub yt_token: Address,
     pub maturity: u64,
+    /// Where the protocol's cut of claimed yield is paid, in SY shares.
+    pub fee_recipient: Address,
+    /// The protocol's cut of *claimed yield*, in basis points. Fixed at
+    /// initialization and never settable again: there is no fee setter, so a
+    /// market's economics cannot change under the people already in it.
+    ///
+    /// The fee is taken from the PT-senior-capped junior surplus (see
+    /// `claim_yield`), never from principal and never from the escrow reserved
+    /// for PT, so it cannot affect PT's face redemption. It moves SY shares
+    /// between the tokenizer's escrow and the recipient without touching
+    /// `total_assets` or the SY supply, so the derived exchange rate is
+    /// unaffected — which is what makes it safe to add at all.
+    pub yield_fee_bps: i128,
 }
 
 /// A holder's PT and YT balances, read from the real token contracts.
@@ -65,6 +90,8 @@ pub enum Error {
     /// Retired: no entrypoint gates on escrow coverage anymore (shortfalls are
     /// priced pro-rata at redemption instead). Kept so code 9 stays reserved.
     Insolvent = 9,
+    /// `yield_fee_bps` was negative or above [`MAX_YIELD_FEE_BPS`].
+    InvalidFee = 10,
 }
 
 #[contract]
@@ -72,6 +99,11 @@ pub struct Tokenizer;
 
 #[contractimpl]
 impl Tokenizer {
+    /// `yield_fee_bps` is the protocol's cut of claimed yield and is immutable
+    /// after this call — there is deliberately no setter, so the fee cannot be
+    /// introduced or raised under holders who already have a position. Pass 0
+    /// for a fee-free market; the plumbing still exists in the wasm, which is
+    /// the point, because it cannot be added later.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -79,6 +111,8 @@ impl Tokenizer {
         pt_token: Address,
         yt_token: Address,
         maturity: u64,
+        fee_recipient: Address,
+        yield_fee_bps: i128,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
@@ -90,12 +124,18 @@ impl Tokenizer {
             return Err(Error::InvalidMaturity);
         }
 
+        if !(0..=MAX_YIELD_FEE_BPS).contains(&yield_fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+
         let config = Config {
             admin,
             sy_token,
             pt_token,
             yt_token,
             maturity,
+            fee_recipient,
+            yield_fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
 
@@ -338,8 +378,9 @@ impl Tokenizer {
 
     /// Pays `holder` their accrued YT yield in SY out of escrow, capped so PT
     /// principal is always senior to banked YT yield, and returns the SY amount
-    /// paid. Allowed any time, including after maturity, so a holder can always
-    /// collect yield earned over the term.
+    /// the holder actually received — net of `yield_fee_bps`. Allowed any time,
+    /// including after maturity, so a holder can always collect yield earned
+    /// over the term.
     ///
     /// PT-senior surplus cap. The YT contract settles the holder and reports the
     /// banked total `owed` WITHOUT zeroing it (`settle`). The tokenizer then pays
@@ -398,12 +439,40 @@ impl Tokenizer {
         // `consume` (YT) nor `push_token` (SY) calls back into the tokenizer, so
         // the re-entrancy model is intact: the rate was computed and frozen above
         // and handed down, never fetched by a callee.
+        // Protocol fee, taken from `pay` and never from `owed`.
+        //
+        // `pay` is already the junior surplus: what is left after
+        // `pt_face_reservation` has been carved out and rounded UP. Skimming
+        // here is therefore structurally incapable of reaching PT's principal —
+        // PT stays senior to the protocol's own cut with no extra logic, and
+        // during a shortfall `pay` is small or zero, so the protocol takes
+        // little or nothing rather than competing with the YT holder for the
+        // last of the escrow.
+        //
+        // It also cannot move the exchange rate. The rate is derived from the
+        // strategy's assets over the SY supply; this only moves SY shares from
+        // escrow to the recipient, changing neither. Rounded DOWN so the notch
+        // favours the holder over the protocol.
+        // `fee = floor(pay * bps / 10_000)` with `0 <= bps <= MAX_YIELD_FEE_BPS`
+        // and `pay >= 0`, so `0 <= fee <= pay` and the subtraction cannot
+        // underflow.
+        let fee = mul_div_floor(&env, pay, config.yield_fee_bps, BPS_DENOMINATOR)?;
+        let net = pay - fee;
+
+        // `consume` the gross: the holder's banked ledger is settled for the
+        // full amount that left escrow on their behalf, fee included, so the
+        // fee cannot be re-claimed later.
         if pay > 0 {
             consume_yt(&env, &config.yt_token, &holder, pay);
-            push_token(&env, &config.sy_token, &holder, pay);
+            if net > 0 {
+                push_token(&env, &config.sy_token, &holder, net);
+            }
+            if fee > 0 {
+                push_token(&env, &config.sy_token, &config.fee_recipient, fee);
+            }
         }
 
-        Ok(pay)
+        Ok(net)
     }
 
     // Note: there is deliberately no `preview_claim_yield` wrapper here. YT's
@@ -651,6 +720,7 @@ mod test {
         sy_token: Address,
         pt_token: Address,
         yt_token: Address,
+        fee_recipient: Address,
     }
 
     fn fixture(now: u64) -> Fixture {
@@ -669,6 +739,7 @@ mod test {
 
         let pt_token = Address::generate(&env);
         let yt_token = Address::generate(&env);
+        let fee_recipient = Address::generate(&env);
 
         Fixture {
             env,
@@ -677,16 +748,25 @@ mod test {
             sy_token,
             pt_token,
             yt_token,
+            fee_recipient,
         }
     }
 
     fn initialize(fixture: &Fixture) {
+        initialize_with_fee(fixture, 0);
+    }
+
+    /// Most tests run fee-free so their arithmetic reads as the protocol's own;
+    /// the fee tests opt in explicitly.
+    fn initialize_with_fee(fixture: &Fixture, yield_fee_bps: i128) {
         fixture.client.initialize(
             &fixture.admin,
             &fixture.sy_token,
             &fixture.pt_token,
             &fixture.yt_token,
             &MATURITY,
+            &fixture.fee_recipient,
+            &yield_fee_bps,
         );
     }
 
@@ -702,6 +782,8 @@ mod test {
                 pt_token: fixture.pt_token.clone(),
                 yt_token: fixture.yt_token.clone(),
                 maturity: MATURITY,
+                fee_recipient: fixture.fee_recipient.clone(),
+                yield_fee_bps: 0,
             }
         );
         assert_eq!(fixture.client.maturity(), MATURITY);
@@ -718,7 +800,52 @@ mod test {
             &fixture.pt_token,
             &fixture.yt_token,
             &NOW,
+            &fixture.fee_recipient,
+            &0_i128,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn initialize_rejects_a_fee_above_the_ceiling() {
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, MAX_YIELD_FEE_BPS + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn initialize_rejects_a_negative_fee() {
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, -1);
+    }
+
+    #[test]
+    fn initialize_accepts_a_fee_at_the_ceiling() {
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, MAX_YIELD_FEE_BPS);
+        assert_eq!(fixture.client.config().yield_fee_bps, MAX_YIELD_FEE_BPS);
+    }
+
+    #[test]
+    fn there_is_no_fee_setter() {
+        // The fee is chosen once, at initialization, and the market's economics
+        // cannot change under holders who already have a position. If a setter
+        // is ever added, this test is the place that should have to argue for it.
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, 500);
+        assert_eq!(fixture.client.config().yield_fee_bps, 500);
+        // Re-initialization is the only route to a different fee, and it is closed.
+        let repeat = fixture.client.try_initialize(
+            &fixture.admin,
+            &fixture.sy_token,
+            &fixture.pt_token,
+            &fixture.yt_token,
+            &MATURITY,
+            &fixture.fee_recipient,
+            &0_i128,
+        );
+        assert!(repeat.is_err(), "a second initialize must not reprice a live market");
+        assert_eq!(fixture.client.config().yield_fee_bps, 500);
     }
 
     #[test]

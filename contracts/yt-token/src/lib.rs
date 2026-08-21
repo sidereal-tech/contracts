@@ -3,7 +3,7 @@
 #![cfg_attr(target_family = "wasm", no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, vec, Address, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, vec, Address, Env, I256,
     String, Symbol, Val,
 };
 
@@ -42,12 +42,26 @@ enum DataKey {
     Balance(Address),
     /// (owner, spender)
     Allowance(Address, Address),
-    /// SY exchange rate the holder's yield was last settled at. Persistent,
-    /// holder-keyed: the contract is single-maturity, so maturity is implicit.
-    Checkpoint(Address),
+    /// The holder's yield BASIS, in SY shares: the number of SY shares that
+    /// back their YT face at the rates that YT was acquired at. Persistent,
+    /// holder-keyed (the contract is single-maturity, so maturity is implicit).
+    ///
+    /// This replaces the old per-address rate `Checkpoint`. A single rate per
+    /// address is not a sound representation of a fungible position: it
+    /// regressed when YT moved to an address with no checkpoint (audit H4,
+    /// re-opening an already-paid interval) and over-held when new YT landed on
+    /// an address already settled at a higher rate (audit M4, stranding the new
+    /// position's yield in escrow). A share basis is additive, so it splits and
+    /// merges with the tokens themselves and both failure modes disappear.
+    YieldBasis(Address),
     /// SY shares accrued to the holder but not yet claimed, carried across
     /// transfers. Persistent, holder-keyed.
     AccruedYield(Address),
+    /// Aggregate of every holder's `YieldBasis`. Instance-scoped.
+    TotalYieldBasis,
+    /// Aggregate of every holder's `AccruedYield`: the protocol-wide banked
+    /// yield ledger. Instance-scoped.
+    TotalAccruedYield,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -114,17 +128,53 @@ impl YtToken {
 
     // --- Yield accounting --------------------------------------------------
 
-    /// The SY rate the holder's yield was last settled at. Zero means the
-    /// holder has never been settled (no YT minted to them yet).
+    /// The holder's yield basis in SY shares: how many SY shares back their YT
+    /// face at the rates that YT was acquired at. Their claim at rate `R` is
+    /// `basis - ceil(balance * WAD / R)` once that is positive, which is exactly
+    /// the escrow surplus their position generates. Zero for an address holding
+    /// no YT.
+    pub fn yield_basis(env: Env, holder: Address) -> Result<i128, Error> {
+        Self::read_config(&env)?;
+        Ok(Self::read_basis(&env, &holder))
+    }
+
+    /// Aggregate yield basis across every holder. Together with
+    /// `total_accrued_yield` this is the protocol-wide YT claim on escrow:
+    /// `escrow_shares >= total_yield_basis() + total_accrued_yield()` holds at
+    /// every state transition of a solvent market, independent of the rate.
+    pub fn total_yield_basis(env: Env) -> Result<i128, Error> {
+        Self::read_config(&env)?;
+        Ok(Self::read_total_basis(&env))
+    }
+
+    /// The SY rate implied by the holder's basis: `ceil(balance * WAD / basis)`,
+    /// the blended rate their whole position last settled at. Exact for a
+    /// position acquired entirely at one rate; a weighted blend otherwise. Zero
+    /// for an address holding no YT. Kept as the human-readable view of the
+    /// basis — the accounting itself uses the share basis, never this rate.
     pub fn checkpoint(env: Env, holder: Address) -> Result<i128, Error> {
         Self::read_config(&env)?;
-        Ok(Self::read_checkpoint(&env, &holder).unwrap_or(0))
+        let basis = Self::read_basis(&env, &holder);
+        let balance = Self::read_balance(&env, &holder);
+        if basis <= 0 || balance <= 0 {
+            return Ok(0);
+        }
+        Self::mul_div_ceil(&env, balance, WAD, basis)
     }
 
     /// SY shares already banked to the holder but not yet claimed.
     pub fn accrued_yield(env: Env, holder: Address) -> Result<i128, Error> {
         Self::read_config(&env)?;
         Ok(Self::read_accrued(&env, &holder))
+    }
+
+    /// Aggregate banked (settled, unclaimed) yield across every holder. The
+    /// aggregate ledger the pro-rata junior split and the post-maturity escrow
+    /// sweep need: it is the exact total SY the escrow still owes YT for yield
+    /// already recognized, readable in one call without enumerating holders.
+    pub fn total_accrued_yield(env: Env) -> Result<i128, Error> {
+        Self::read_config(&env)?;
+        Ok(Self::read_total_accrued(&env))
     }
 
     /// Total SY shares claimable by `holder` right now: already-banked yield
@@ -135,6 +185,16 @@ impl YtToken {
     /// executed `claim_yield` amount may differ if the rate moves between this
     /// quote and submission. After maturity it uses the tokenizer's frozen
     /// maturity rate (see `preview_rate`), so it no longer tracks live accrual.
+    ///
+    /// **This figure is GROSS.** It is the yield the position has earned, which
+    /// is the right number for valuing YT — but it is not necessarily what the
+    /// holder receives. `Tokenizer::claim_yield` caps the payout at the junior
+    /// surplus over PT's reservation and then takes the market's
+    /// `yield_fee_bps`, and it returns that net amount. This contract
+    /// deliberately does not apply either adjustment: the cap depends on escrow
+    /// and PT supply that live in the tokenizer, and reading them from here
+    /// during a claim would be re-entry. A UI quoting "you will receive" should
+    /// read `yield_fee_bps` from the tokenizer's config and apply it.
     pub fn preview_claim_yield(env: Env, holder: Address) -> Result<i128, Error> {
         let config = Self::read_config(&env)?;
         let rate = Self::preview_rate(&env, &config);
@@ -193,12 +253,27 @@ impl YtToken {
         Ok(())
     }
 
+    // Note: there is deliberately no aggregate `total_claimable(rate)` here.
+    // The two aggregates above are exact sums and compose safely; a rate-priced
+    // aggregate does not. Per holder the claim is `max(0, basis - required)`,
+    // and the max does not distribute over a sum: a holder whose basis rate is
+    // above `rate` is held at zero rather than contributing a negative, so
+    // `total_yield_basis - ceil(total_supply * WAD / rate)` sits BELOW the true
+    // total whenever anyone is underwater. Sizing a sweep or a pro-rata junior
+    // split off that would under-reserve exactly when the market is short.
+    // Callers wanting a rate-priced total must settle the holders they are
+    // paying, which is what the tokenizer's claim path already does.
+
     // --- Minter-privileged supply control (only the tokenizer) -------------
 
     /// Mints `amount` YT to `to`. Restricted to the tokenizer recorded at
     /// initialization, which mints YT when a holder splits SY. The recipient is
-    /// settled first, so a fresh holder's checkpoint starts at the current rate
-    /// and an existing holder's prior yield is banked before the balance grows.
+    /// settled first, so an existing holder's prior yield is banked before the
+    /// balance grows; the new YT then adds its OWN basis at the mint rate, on
+    /// top of whatever basis the recipient already carried. That is what fixes
+    /// audit M4: a second split at a lower rate into an already-settled address
+    /// earns from its own, lower basis instead of inheriting the address's
+    /// earlier high-water rate and earning nothing.
     pub fn mint(env: Env, to: Address, amount: i128) {
         let config = Self::read_config_or_panic(&env);
         config.tokenizer.require_auth();
@@ -213,6 +288,16 @@ impl YtToken {
         // freeze already has it on record.
         let rate = Self::current_rate(&env, &config);
         Self::settle_into_ledger(&env, &to, rate);
+
+        // Basis for the newly minted face, rounded UP so the escrow is never
+        // short: the tokenizer floors `face = sy_amount * rate / WAD`, so
+        // `ceil(face * WAD / rate) <= sy_amount`, the SY it just escrowed.
+        let added = match Self::shares_for_face(&env, amount, rate) {
+            Ok(value) => value,
+            Err(error) => panic_with_error!(&env, error),
+        };
+        let basis = Self::read_basis(&env, &to);
+        Self::write_basis(&env, &to, Self::add_or_panic(&env, basis, added));
 
         let balance = Self::read_balance(&env, &to);
         Self::write_balance(&env, &to, Self::add_or_panic(&env, balance, amount));
@@ -267,6 +352,12 @@ impl YtToken {
         Self::write_allowance(&env, &from, &spender, amount, expiration_ledger);
     }
 
+    /// Moves `amount` YT from `from` to `to`. Both parties are settled at the
+    /// same rate before any balance moves, so each banks the yield it earned on
+    /// the balance it actually held, and the basis backing the moved YT travels
+    /// with it (see `move_position`). A self-transfer is a clean no-op: the
+    /// second settle finds nothing left to bank and the basis slice leaves and
+    /// returns to the same address.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         Self::require_amount_or_panic(&env, amount);
@@ -275,7 +366,7 @@ impl YtToken {
         let rate = Self::committing_rate(&env, &config);
         Self::settle_into_ledger(&env, &from, rate);
         Self::settle_into_ledger(&env, &to, rate);
-        Self::move_balance(&env, &from, &to, amount);
+        Self::move_position(&env, &from, &to, amount);
     }
 
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -287,7 +378,7 @@ impl YtToken {
         let rate = Self::committing_rate(&env, &config);
         Self::settle_into_ledger(&env, &from, rate);
         Self::settle_into_ledger(&env, &to, rate);
-        Self::move_balance(&env, &from, &to, amount);
+        Self::move_position(&env, &from, &to, amount);
     }
 
     /// Burns `amount` YT from `from`, on a holder's own direct call. The
@@ -307,7 +398,7 @@ impl YtToken {
         let config = Self::read_config_or_panic(&env);
         let rate = Self::committing_rate(&env, &config);
         Self::settle_into_ledger(&env, &from, rate);
-        Self::burn_balance(&env, &from, amount);
+        Self::burn_position(&env, &from, amount);
     }
 
     /// Burns `amount` YT from `from`, settling them first at the `rate`
@@ -325,7 +416,7 @@ impl YtToken {
         }
         Self::bump_instance_ttl(&env);
         Self::settle_into_ledger(&env, &from, rate);
-        Self::burn_balance(&env, &from, amount);
+        Self::burn_position(&env, &from, amount);
         Ok(())
     }
 
@@ -337,7 +428,7 @@ impl YtToken {
         let config = Self::read_config_or_panic(&env);
         let rate = Self::committing_rate(&env, &config);
         Self::settle_into_ledger(&env, &from, rate);
-        Self::burn_balance(&env, &from, amount);
+        Self::burn_position(&env, &from, amount);
     }
 
     // --- yield engine ------------------------------------------------------
@@ -408,79 +499,99 @@ impl YtToken {
         }
     }
 
-    /// SY shares `holder` would accrue if settled at `rate` right now, without
-    /// writing anything. Zero before the holder is first settled.
-    fn pending_yield(env: &Env, holder: &Address, rate: i128) -> Result<i128, Error> {
-        let last = match Self::read_checkpoint(env, holder) {
-            Some(c) => c,
-            None => return Ok(0),
-        };
-        if rate <= last {
+    /// SY shares needed to back `face` asset units of YT at `rate`, rounded UP.
+    /// Rounding up is the escrow-favoring direction on both sides of the
+    /// accounting: it shrinks the yield a settle recognizes
+    /// (`basis - shares_for_face`) and it makes a mint reserve at least as much
+    /// basis as the SY the tokenizer actually escrowed.
+    fn shares_for_face(env: &Env, face: i128, rate: i128) -> Result<i128, Error> {
+        if rate <= 0 {
+            return Err(Error::InvalidExchangeRate);
+        }
+        if face <= 0 {
             return Ok(0);
         }
+        Self::mul_div_ceil(env, face, WAD, rate)
+    }
+
+    /// SY shares `holder` would accrue if settled at `rate` right now, without
+    /// writing anything. Zero while the rate sits at or below the rate their
+    /// basis was struck at.
+    fn pending_yield(env: &Env, holder: &Address, rate: i128) -> Result<i128, Error> {
         let balance = Self::read_balance(env, holder);
         if balance <= 0 {
             return Ok(0);
         }
-        Self::owed_shares(balance, last, rate)
+        let basis = Self::read_basis(env, holder);
+        let required = Self::shares_for_face(env, balance, rate)?;
+        Ok(if basis > required { basis - required } else { 0 })
     }
 
-    /// Banks `holder`'s accrued yield up to `rate` and advances their
-    /// checkpoint. Bookkeeping only: it never moves SY. A fresh holder simply
-    /// starts accruing from `rate`. On a rate dip the checkpoint is held (not
-    /// lowered), so no yield is paid for the dip and the holder resumes accruing
-    /// only once the rate climbs back above it. The caller sources `rate` (live
-    /// before maturity, the tokenizer's canonical frozen rate after) so this
-    /// function makes no cross-contract call of its own.
+    /// Banks `holder`'s accrued yield up to `rate` and re-strikes their basis at
+    /// `rate`. Bookkeeping only: it never moves SY. The caller sources `rate`
+    /// (live before maturity, the tokenizer's canonical frozen rate after) so
+    /// this function makes no cross-contract call of its own.
+    ///
+    /// The whole engine is one identity. A holder's basis is the SY shares that
+    /// back their YT face at the rates they acquired it at; the shares that same
+    /// face needs at `rate` is `shares_for_face(balance, rate)`; the difference
+    /// is exactly the escrow surplus their position has generated, so
+    ///
+    /// ```text
+    /// owed      = basis - shares_for_face(balance, rate)
+    /// new_basis =         shares_for_face(balance, rate)
+    /// ```
+    ///
+    /// with `new_basis + owed == basis` exactly — no share is created or
+    /// destroyed by a settle, which is why yield telescopes exactly across
+    /// intermediate settlements. Settling twice (c -> r1 -> r2) banks
+    /// `basis(c) - S(r1) + S(r1) - S(r2)`, identical to one settle c -> r2, and
+    /// this holds for the rounded integers too because the same `S(r1)` is both
+    /// subtracted and added back.
+    ///
+    /// On a rate dip `basis <= required` and the basis is HELD, not lowered, so
+    /// the dip pays nothing and the holder resumes accruing only once the rate
+    /// climbs back above it. Unlike the old per-address rate checkpoint, this
+    /// hold cannot be dodged by moving the YT to an address that has none: basis
+    /// travels with the tokens (see `move_position`), so there is no address
+    /// whose basis is "unset" and gets initialized to a dipped rate (audit H4).
     ///
     /// Named `settle_into_ledger` to distinguish it from the public `settle`
     /// entrypoint, which wraps this and returns the banked total without zeroing.
     fn settle_into_ledger(env: &Env, holder: &Address, rate: i128) {
-        let last = match Self::read_checkpoint(env, holder) {
-            Some(c) => c,
-            None => {
-                Self::write_checkpoint(env, holder, rate);
-                return;
-            }
+        let balance = Self::read_balance(env, holder);
+        if balance <= 0 {
+            // No YT, so no basis and nothing to settle. A fresh recipient is
+            // settled here before their balance grows; their basis arrives with
+            // the tokens themselves, in `mint` or `move_position`.
+            return;
+        }
+        let basis = Self::read_basis(env, holder);
+        let required = match Self::shares_for_face(env, balance, rate) {
+            Ok(value) => value,
+            Err(error) => panic_with_error!(env, error),
         };
-
-        if rate <= last {
+        if basis <= required {
             return;
         }
 
-        let balance = Self::read_balance(env, holder);
-        if balance > 0 {
-            let owed = match Self::owed_shares(balance, last, rate) {
-                Ok(value) => value,
-                Err(error) => panic_with_error!(env, error),
-            };
-            if owed > 0 {
-                let prev = Self::read_accrued(env, holder);
-                Self::write_accrued(env, holder, Self::add_or_panic(env, prev, owed));
-            }
-        }
-        Self::write_checkpoint(env, holder, rate);
+        let owed = basis - required;
+        Self::write_basis(env, holder, required);
+        let prev = Self::read_accrued(env, holder);
+        Self::write_accrued(env, holder, Self::add_or_panic(env, prev, owed));
     }
 
-    /// Yield owed for a balance held from rate `c` to rate `r`, in SY shares:
-    ///   balance * (r - c) / (c * r) * WAD   ==   balance * (1/c - 1/r) * WAD
-    /// This telescopes across intermediate settlements, so settling at every
-    /// transfer banks exactly the same total as one settle at the end. Computed
-    /// in a fixed order with checked math to stay within i128 under the testnet
-    /// input bounds, rounding down (favoring the escrow).
-    fn owed_shares(balance: i128, c: i128, r: i128) -> Result<i128, Error> {
-        // asset yield measured at the checkpoint basis: balance * (r - c) / c
-        let delta = r.checked_sub(c).ok_or(Error::MathOverflow)?;
-        let asset_yield = balance
-            .checked_mul(delta)
-            .ok_or(Error::MathOverflow)?
-            .checked_div(c)
-            .ok_or(Error::MathOverflow)?;
-        // convert to SY shares at the current rate: asset_yield * WAD / r
-        asset_yield
-            .checked_mul(WAD)
-            .ok_or(Error::MathOverflow)?
-            .checked_div(r)
+    /// `a * b / c` rounded up, via `(a * b + c - 1) / c` computed through a
+    /// 256-bit intermediate so the product cannot overflow before the divide
+    /// (`balance * WAD` exceeds i128 well before the quotient does). Callers
+    /// pass non-negative `a`, `b` and positive `c`.
+    fn mul_div_ceil(env: &Env, a: i128, b: i128, c: i128) -> Result<i128, Error> {
+        let c256 = I256::from_i128(env, c);
+        let prod = I256::from_i128(env, a).mul(&I256::from_i128(env, b));
+        prod.add(&c256)
+            .sub(&I256::from_i128(env, 1))
+            .div(&c256)
+            .to_i128()
             .ok_or(Error::MathOverflow)
     }
 
@@ -500,18 +611,46 @@ impl YtToken {
         }
     }
 
-    fn read_checkpoint(env: &Env, holder: &Address) -> Option<i128> {
+    fn read_basis(env: &Env, holder: &Address) -> i128 {
         env.storage()
             .persistent()
-            .get(&DataKey::Checkpoint(holder.clone()))
+            .get(&DataKey::YieldBasis(holder.clone()))
+            .unwrap_or(0)
     }
 
-    fn write_checkpoint(env: &Env, holder: &Address, rate: i128) {
-        let key = DataKey::Checkpoint(holder.clone());
-        env.storage().persistent().set(&key, &rate);
+    /// Writes the holder's basis and keeps `TotalYieldBasis` in step by the
+    /// same delta, so the aggregate is exact by construction rather than by a
+    /// separate accounting path that could drift.
+    fn write_basis(env: &Env, holder: &Address, amount: i128) {
+        let prev = Self::read_basis(env, holder);
+        let key = DataKey::YieldBasis(holder.clone());
+        env.storage().persistent().set(&key, &amount);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+
+        let total = Self::read_total_basis(env);
+        let delta = match amount.checked_sub(prev) {
+            Some(value) => value,
+            None => panic_with_error!(env, Error::MathOverflow),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalYieldBasis, &Self::add_or_panic(env, total, delta));
+    }
+
+    fn read_total_basis(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalYieldBasis)
+            .unwrap_or(0)
+    }
+
+    fn read_total_accrued(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalAccruedYield)
+            .unwrap_or(0)
     }
 
     fn bump_instance_ttl(env: &Env) {
@@ -527,12 +666,25 @@ impl YtToken {
             .unwrap_or(0)
     }
 
+    /// Writes the holder's banked yield and keeps `TotalAccruedYield` in step by
+    /// the same delta, so the aggregate banked-yield ledger is exact.
     fn write_accrued(env: &Env, holder: &Address, amount: i128) {
+        let prev = Self::read_accrued(env, holder);
         let key = DataKey::AccruedYield(holder.clone());
         env.storage().persistent().set(&key, &amount);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+
+        let total = Self::read_total_accrued(env);
+        let delta = match amount.checked_sub(prev) {
+            Some(value) => value,
+            None => panic_with_error!(env, Error::MathOverflow),
+        };
+        env.storage().instance().set(
+            &DataKey::TotalAccruedYield,
+            &Self::add_or_panic(env, total, delta),
+        );
     }
 
     fn require_amount_or_panic(env: &Env, amount: i128) {
@@ -563,26 +715,78 @@ impl YtToken {
             .unwrap_or(0)
     }
 
-    fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
+    /// Moves `amount` YT and the basis that backs it from `from` to `to`. Both
+    /// parties are settled before this runs, so `from`'s basis is already struck
+    /// at the current rate and the pro-rata slice is exact for the common case.
+    ///
+    /// Carrying the basis is the fix for audit H4. The old code left the
+    /// receiver's rate checkpoint to be initialized by the settle, which for an
+    /// address that had none meant "start at the current rate" — during a dip
+    /// that reset the YT's high-water mark downward and re-opened an interval
+    /// the sender had already been paid for. Basis is a share quantity, so it
+    /// simply splits: whatever leaves `from` arrives at `to`, the aggregate is
+    /// conserved, and a fully-paid-up position stays fully paid up wherever it
+    /// lands.
+    ///
+    /// The slice rounds UP, so the sender parts with at least the proportional
+    /// basis and can never keep a sliver that lets the pair claim more than one
+    /// undivided holder would have. A self-transfer nets to zero on both the
+    /// balance and the basis.
+    fn move_position(env: &Env, from: &Address, to: &Address, amount: i128) {
         let from_balance = Self::read_balance(env, from);
         if from_balance < amount {
             panic_with_error!(env, Error::InsufficientBalance);
         }
+
+        let from_basis = Self::read_basis(env, from);
+        let moved = Self::basis_slice(env, from_basis, amount, from_balance);
+        Self::write_basis(env, from, from_basis - moved);
+        let to_basis = Self::read_basis(env, to);
+        Self::write_basis(env, to, Self::add_or_panic(env, to_basis, moved));
+
         Self::write_balance(env, from, from_balance - amount);
         let to_balance = Self::read_balance(env, to);
         Self::write_balance(env, to, Self::add_or_panic(env, to_balance, amount));
     }
 
-    fn burn_balance(env: &Env, from: &Address, amount: i128) {
+    /// Burns `amount` YT from `from` and retires the basis that backed it. The
+    /// slice rounds UP so the surviving balance is never left over-based, which
+    /// keeps `escrow >= total_yield_basis + total_accrued_yield` through the
+    /// tokenizer's recombine (which pays out at most the principal the retired
+    /// basis was reserving).
+    fn burn_position(env: &Env, from: &Address, amount: i128) {
         let from_balance = Self::read_balance(env, from);
         if from_balance < amount {
             panic_with_error!(env, Error::InsufficientBalance);
         }
+
+        let from_basis = Self::read_basis(env, from);
+        let retired = Self::basis_slice(env, from_basis, amount, from_balance);
+        Self::write_basis(env, from, from_basis - retired);
+
         Self::write_balance(env, from, from_balance - amount);
         let supply = Self::read_total_supply(env);
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
+    }
+
+    /// The basis backing `amount` out of a `balance`-sized position, rounded up
+    /// and never more than the whole basis. Exact when the whole position moves,
+    /// which keeps a full transfer or a full burn from stranding basis on an
+    /// address with no YT left.
+    fn basis_slice(env: &Env, basis: i128, amount: i128, balance: i128) -> i128 {
+        if basis <= 0 || amount <= 0 || balance <= 0 {
+            return 0;
+        }
+        if amount >= balance {
+            return basis;
+        }
+        match Self::mul_div_ceil(env, basis, amount, balance) {
+            Ok(value) if value <= basis => value,
+            Ok(_) => basis,
+            Err(error) => panic_with_error!(env, error),
+        }
     }
 
     fn read_allowance(env: &Env, from: &Address, spender: &Address) -> AllowanceValue {
@@ -706,6 +910,8 @@ mod test {
             &pt_placeholder,
             &contract_id,
             &MATURITY,
+            &admin,
+            &0_i128,
         );
 
         Fixture {
@@ -737,15 +943,22 @@ mod test {
     }
 
     #[test]
-    fn mint_settles_fresh_holder_to_current_rate() {
+    fn mint_bases_fresh_holder_at_the_current_rate() {
         let f = fixture(NOW);
         f.sy.set_exchange_rate(&f.admin, &RATE_1_05);
         f.client.mint(&f.alice, &(100 * WAD));
 
-        // Checkpoint starts at the rate when YT was first minted, so prior
-        // history is not retroactively claimable.
-        assert_eq!(f.client.checkpoint(&f.alice), RATE_1_05);
+        // The basis is struck at the rate the YT was minted at, so prior
+        // history is not retroactively claimable. In shares that is
+        // ceil(face * WAD / rate).
+        let expected_basis = ((100 * WAD) * WAD + RATE_1_05 - 1) / RATE_1_05;
+        assert_eq!(f.client.yield_basis(&f.alice), expected_basis);
+        assert_eq!(f.client.checkpoint(&f.alice), RATE_1_05, "implied rate");
         assert_eq!(f.client.accrued_yield(&f.alice), 0);
+
+        // The aggregates track the per-holder entries exactly.
+        assert_eq!(f.client.total_yield_basis(), expected_basis);
+        assert_eq!(f.client.total_accrued_yield(), 0);
     }
 
     #[test]
@@ -772,6 +985,48 @@ mod test {
         assert_eq!(f.client.checkpoint(&f.alice), RATE_1_10);
         // The ledger still holds the banked total: settle does not consume it.
         assert_eq!(f.client.accrued_yield(&f.alice), claimable);
+        assert_eq!(f.client.total_accrued_yield(), claimable);
+
+        // A settle moves shares from basis to the banked ledger and creates
+        // none: basis + banked is invariant across the settle.
+        let expected_basis = ((100 * WAD) * WAD + RATE_1_05 - 1) / RATE_1_05;
+        assert_eq!(
+            f.client.yield_basis(&f.alice) + claimable,
+            expected_basis,
+            "settle conserves shares"
+        );
+    }
+
+    /// Yield must telescope exactly: settling at every intermediate rate banks
+    /// the same total as one settle at the end. The basis makes this exact
+    /// rather than approximate, because each intermediate settle subtracts a
+    /// value and immediately stores that same value as the new basis.
+    #[test]
+    fn settling_at_every_step_banks_the_same_as_one_settle_at_the_end() {
+        const STEPS: i128 = 25;
+
+        let stepwise = {
+            let f = fixture(NOW);
+            f.sy.set_exchange_rate(&f.admin, &RATE_1_00);
+            f.client.mint(&f.alice, &(100 * WAD));
+            for i in 1..=STEPS {
+                f.client.settle(&f.alice, &(RATE_1_00 + i * (WAD / 100)));
+            }
+            f.client.accrued_yield(&f.alice)
+        };
+
+        let one_shot = {
+            let f = fixture(NOW);
+            f.sy.set_exchange_rate(&f.admin, &RATE_1_00);
+            f.client.mint(&f.alice, &(100 * WAD));
+            f.client.settle(&f.alice, &(RATE_1_00 + STEPS * (WAD / 100)))
+        };
+
+        assert_eq!(
+            stepwise, one_shot,
+            "{} intermediate settles must bank exactly what one settle banks",
+            STEPS
+        );
     }
 
     #[test]
@@ -789,8 +1044,8 @@ mod test {
         f.client.consume(&f.alice, &part);
         assert_eq!(f.client.accrued_yield(&f.alice), banked - part);
 
-        // A second settle at the same rate adds nothing (checkpoint held), so the
-        // remainder is still exactly what was left.
+        // A second settle at the same rate adds nothing (the basis is already
+        // struck there), so the remainder is still exactly what was left.
         let still = f.client.settle(&f.alice, &RATE_1_10);
         assert_eq!(still, banked - part);
     }
@@ -848,6 +1103,151 @@ mod test {
             bob2,
             single
         );
+    }
+
+    /// Audit H4, at the YT layer. A holder settled at a peak transfers their
+    /// fully-paid-up YT to a fresh address during a dip. Under the old
+    /// per-address rate checkpoint the receiver's checkpoint was initialized to
+    /// the dipped rate, so when the rate merely returned to the peak the
+    /// receiver could claim the interval the sender had already been paid for.
+    /// The basis travels with the YT, so the receiver inherits a paid-up
+    /// position and the round trip pays nothing.
+    #[test]
+    fn transfer_into_a_fresh_address_during_a_dip_re_opens_nothing() {
+        let f = fixture(NOW);
+        f.client.mint(&f.alice, &(100 * WAD)); // basis struck at 1.00
+
+        // Peak: Alice settles at 1.10 and is (conceptually) paid in full.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        let paid = f.client.settle(&f.alice, &RATE_1_10);
+        assert!(paid > 0);
+        f.client.consume(&f.alice, &paid); // the tokenizer pushes the SY out
+        assert_eq!(f.client.accrued_yield(&f.alice), 0);
+
+        // Dip, then the escape hatch: move the whole paid-up position to a
+        // brand-new address that has never been settled.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_05);
+        let fresh = Address::generate(&f.env);
+        f.client.transfer(&f.alice, &fresh, &(100 * WAD));
+
+        // Rate merely returns to the peak. No new yield exists, so the fresh
+        // address must be owed nothing.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        assert_eq!(
+            f.client.settle(&fresh, &RATE_1_10),
+            0,
+            "the recipient must not re-claim an interval that was already paid"
+        );
+        assert_eq!(f.client.settle(&f.alice, &RATE_1_10), 0);
+        assert_eq!(f.client.total_accrued_yield(), 0);
+    }
+
+    /// Audit M4, at the YT layer. An address already settled at a peak acquires
+    /// new YT at a lower rate. Under the per-address high-water checkpoint the
+    /// new YT inherited the old peak and earned nothing until the rate passed
+    /// it, stranding the value in escrow. With an additive basis the new YT
+    /// carries its own, so a re-used address earns exactly what a clean one does.
+    #[test]
+    fn re_used_address_earns_the_same_as_a_clean_one_on_yt_acquired_after_a_dip() {
+        let f = fixture(NOW);
+
+        // Alice settles at the 1.10 peak on an earlier position.
+        f.client.mint(&f.alice, &(100 * WAD));
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        let paid = f.client.settle(&f.alice, &RATE_1_10);
+        f.client.consume(&f.alice, &paid);
+
+        // Dip to 1.05. Alice mints a second position onto the SAME address;
+        // Bob mints an identical one onto a clean address.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_05);
+        f.client.mint(&f.alice, &(100 * WAD));
+        f.client.mint(&f.bob, &(100 * WAD));
+
+        // Recovery to 1.10: the second position earned 1.05 -> 1.10 in both
+        // cases, and Alice's older, paid-up half adds nothing.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        let alice_owed = f.client.settle(&f.alice, &RATE_1_10);
+        let bob_owed = f.client.settle(&f.bob, &RATE_1_10);
+        assert!(bob_owed > 0, "the clean address earns on the dip recovery");
+        assert_eq!(
+            alice_owed, bob_owed,
+            "re-using an address must not forfeit yield on YT acquired later"
+        );
+
+        // And it is the right number: 100 * (1/1.05 - 1/1.10) SY shares.
+        let expected = (100 * WAD) * (RATE_1_10 - RATE_1_05) / RATE_1_05 * WAD / RATE_1_10;
+        assert!(
+            (bob_owed - expected).abs() <= 2,
+            "owed {} vs expected {}",
+            bob_owed,
+            expected
+        );
+    }
+
+    /// A self-transfer must change nothing: not the balance, not the basis, not
+    /// the aggregates. The settle runs twice on the same holder and the basis
+    /// slice leaves and returns to the same address.
+    #[test]
+    fn self_transfer_is_a_no_op() {
+        let f = fixture(NOW);
+        f.client.mint(&f.alice, &(100 * WAD));
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        f.client.settle(&f.alice, &RATE_1_10);
+
+        let balance = f.client.balance(&f.alice);
+        let basis = f.client.yield_basis(&f.alice);
+        let banked = f.client.accrued_yield(&f.alice);
+        let supply = f.client.total_supply();
+
+        f.client.transfer(&f.alice, &f.alice, &(40 * WAD));
+
+        assert_eq!(f.client.balance(&f.alice), balance);
+        assert_eq!(f.client.yield_basis(&f.alice), basis);
+        assert_eq!(f.client.accrued_yield(&f.alice), banked);
+        assert_eq!(f.client.total_supply(), supply);
+        assert_eq!(f.client.total_yield_basis(), basis);
+        assert_eq!(f.client.total_accrued_yield(), banked);
+    }
+
+    /// Splitting one position across many addresses must not manufacture yield.
+    /// The basis is conserved by every move, so a fan-out and a fan-back-in
+    /// leave exactly the original entitlement.
+    #[test]
+    fn fanning_a_position_out_and_back_conserves_the_entitlement() {
+        let f = fixture(NOW);
+        f.client.mint(&f.alice, &(100 * WAD)); // basis at 1.00
+
+        let hops: std::vec::Vec<Address> =
+            (0..5).map(|_| Address::generate(&f.env)).collect();
+
+        // Fan out during a dip, the window the old checkpoint reset in.
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_05);
+        for hop in &hops {
+            f.client.transfer(&f.alice, hop, &(20 * WAD));
+        }
+        assert_eq!(f.client.balance(&f.alice), 0);
+
+        f.sy.set_exchange_rate(&f.admin, &RATE_1_10);
+        let mut total = f.client.settle(&f.alice, &RATE_1_10);
+        for hop in &hops {
+            total += f.client.settle(hop, &RATE_1_10);
+        }
+
+        // One undivided holder over 1.00 -> 1.10.
+        let single = (100 * WAD) * (RATE_1_10 - RATE_1_00) / RATE_1_00 * WAD / RATE_1_10;
+        assert!(
+            total <= single,
+            "fanning out must never manufacture yield: {} vs {}",
+            total,
+            single
+        );
+        assert!(
+            single - total <= 16,
+            "fanning out must not lose more than rounding dust: {} vs {}",
+            total,
+            single
+        );
+        assert_eq!(f.client.total_accrued_yield(), total);
     }
 
     #[test]

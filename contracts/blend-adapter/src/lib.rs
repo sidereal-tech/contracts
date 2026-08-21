@@ -134,9 +134,18 @@ pub fn assets_from_b_tokens(b_tokens: i128, b_rate: i128) -> Option<i128> {
 
 /// The SY exchange rate (asset-per-share, WAD) derived from the vault's real
 /// holdings: `aum * WAD / sy_supply`. Returns WAD when no SY is outstanding
-/// (bootstrap). Because `aum` tracks a Blend position whose value only rises with
-/// accrued interest, this rate is monotonic under normal operation — no admin can
-/// lower it, which is the whole point. Checked; `None` on overflow.
+/// (bootstrap). Checked; `None` on overflow.
+///
+/// The rate is *derived*, which is the property that matters: no admin can set
+/// it, so the `#9 Insolvent` root cause cannot re-enter here.
+///
+/// It is **not** monotonic, and code above must not assume it is. Blend v2
+/// socializes bad debt by decreasing `b_rate` (`User::default_liabilities`),
+/// reachable through the permissionless `bad_debt` pool entrypoint once the
+/// backstop is drained, and it hits plain supply positions too. A decline is
+/// therefore a real operating state, not an impossible one: the vault stays
+/// solvent and simply pays less, but consumers that reject a regression
+/// (YT's checkpoint, the AMM's rate floors) will halt until it recovers.
 pub fn derived_exchange_rate(aum: i128, sy_supply: i128) -> Option<i128> {
     if sy_supply <= 0 {
         return Some(WAD);
@@ -193,16 +202,30 @@ mod test {
     }
 
     #[test]
-    fn derived_rate_is_monotonic_as_interest_accrues() {
-        // Same SY supply; as the Blend position's asset value grows, the rate
-        // only rises. This is the property that makes `#9` impossible: nobody can
-        // set it down, and YT yield tracks the increase.
+    fn derived_rate_tracks_aum_upward_as_interest_accrues() {
+        // Same SY supply; as the Blend position's asset value grows, so does the
+        // rate. This is the normal path — it is NOT a monotonicity guarantee,
+        // see `derived_rate_falls_when_blend_socializes_bad_debt`.
         let supply = 100 * UNIT;
         let r0 = derived_exchange_rate(100 * UNIT, supply).unwrap();
         let r1 = derived_exchange_rate(105 * UNIT, supply).unwrap();
         let r2 = derived_exchange_rate(120 * UNIT, supply).unwrap();
         assert_eq!(r0, WAD);
         assert!(r1 > r0 && r2 > r1, "rate must rise with AUM: {r0} {r1} {r2}");
+    }
+
+    #[test]
+    fn derived_rate_falls_when_blend_socializes_bad_debt() {
+        // Blend v2 writes bad debt off against `b_rate`, so AUM can drop without
+        // anyone touching this vault. The rate must follow it down rather than
+        // saturate: an over-reported rate would let redeemers draw more than the
+        // position holds. Pinned as a test so nothing above re-derives a
+        // monotonicity assumption from the happy path.
+        let supply = 100 * UNIT;
+        let before = derived_exchange_rate(120 * UNIT, supply).unwrap();
+        let after = derived_exchange_rate(90 * UNIT, supply).unwrap();
+        assert!(after < before, "rate must fall with AUM: {before} -> {after}");
+        assert_eq!(after, derived_exchange_rate(90 * UNIT, supply).unwrap());
     }
 
     #[test]
