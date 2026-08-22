@@ -111,13 +111,6 @@ save_state() {
     printf 'ORDERBOOK_FEE_BPS=%s\n' "$(quote_env "$ORDERBOOK_FEE_BPS")"
     printf 'FEE_RECIPIENT=%s\n' "$(quote_env "${FEE_RECIPIENT:-}")"
     printf 'TWAP_WINDOW=%s\n' "$(quote_env "$TWAP_WINDOW")"
-    # Persisted like every other economic parameter. Without this a resumed
-    # deploy skips INIT_TK (already done) but re-derives these from a plain
-    # environment, so the manifest would record 0/deployer for a market the
-    # chain has at whatever the first run passed -- a recorded fee that
-    # contradicts the immutable one actually deployed.
-    printf 'YIELD_FEE_BPS=%s\n' "$(quote_env "$YIELD_FEE_BPS")"
-    printf 'FEE_RECIPIENT=%s\n' "$(quote_env "${FEE_RECIPIENT:-}")"
     printf 'BLEND_POOL=%s\n' "$(quote_env "$BLEND_POOL")"
     printf 'BLEND_USDC=%s\n' "$(quote_env "$BLEND_USDC")"
     printf 'BLEND_USDC_ASSET=%s\n' "$(quote_env "$BLEND_USDC_ASSET")"
@@ -236,17 +229,20 @@ fi
 SOURCE_COMMIT="$CURRENT_SOURCE_COMMIT"
 
 # Fee reconciliation, following the SOURCE_COMMIT precedent above. Which source
-# wins depends on whether the tokenizer has been initialized, because that is
-# the moment `fee_recipient` and `yield_fee_bps` stop being changeable:
+# wins depends on whether the tokenizer has been initialized. `fee_recipient`
+# becomes immutable then; `yield_fee_bps` remains admin-settable on-chain, but
+# this deploy script records the opening value and never disguises a resumed
+# deployment as a fee-management action:
 #
 #   INIT_TK != 1 -- still mutable. An explicit env value WINS, so an operator
 #                   retrying a crashed deploy can correct a typo.
-#   INIT_TK == 1 -- already on chain and immutable. A conflicting env value is
-#                   fatal rather than silently ignored, because the manifest
-#                   would otherwise record something the market does not have.
+#   INIT_TK == 1 -- opening values are already on chain. A conflicting env
+#                   value is fatal rather than silently ignored or applied.
+#                   Use tokenizer.set_fee separately for a live fee change;
+#                   fee_recipient cannot be changed at all.
 if [[ "${INIT_TK:-0}" == "1" ]]; then
   if [[ -n "$YIELD_FEE_BPS_ENV" && "$YIELD_FEE_BPS_ENV" != "$YIELD_FEE_BPS" ]]; then
-    die "tokenizer is already initialized with yield_fee_bps=$YIELD_FEE_BPS; it is immutable and cannot be changed to $YIELD_FEE_BPS_ENV"
+    die "tokenizer opened with yield_fee_bps=$YIELD_FEE_BPS; a resumed deploy will not change it to $YIELD_FEE_BPS_ENV -- use tokenizer.set_fee after deployment"
   fi
   if [[ -n "$FEE_RECIPIENT_ENV" && "$FEE_RECIPIENT_ENV" != "${FEE_RECIPIENT:-}" ]]; then
     die "tokenizer is already initialized with fee_recipient=${FEE_RECIPIENT:-}; it is immutable and cannot be changed to $FEE_RECIPIENT_ENV"
