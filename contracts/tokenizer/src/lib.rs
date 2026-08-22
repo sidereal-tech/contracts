@@ -451,6 +451,17 @@ impl Tokenizer {
         Ok(sy_to_pay)
     }
 
+    /// SY shares presently available to all junior YT claims after reserving
+    /// enough escrow for every outstanding PT. This is the payout cap future
+    /// sweep or pro-rata logic must use; YT's aggregate basis/accrual views are
+    /// obligations and can exceed what escrow can actually pay after a loss or
+    /// redemption.
+    pub fn available_yield_surplus(env: Env) -> Result<i128, Error> {
+        let config = Self::read_config(&env)?;
+        let rate = effective_rate(&env, &config);
+        junior_surplus(&env, &config, rate)
+    }
+
     /// Pays `holder` their accrued YT yield in SY out of escrow, capped so PT
     /// principal is always senior to banked YT yield, and returns the SY amount
     /// the holder actually received — net of `yield_fee_bps`. Allowed any time,
@@ -498,15 +509,7 @@ impl Tokenizer {
         // face at `rate` (rounded UP so PT is never shorted), and pay YT only out
         // of the remainder. `escrow_shares` and `pt_supply` are read the same way
         // `redeem_at_maturity` reads them.
-        let escrow_shares =
-            token_balance(&env, &config.sy_token, &env.current_contract_address());
-        let pt_supply = pt_total_supply(&env, &config.pt_token);
-        let pt_face_reservation = mul_div_ceil(&env, pt_supply, WAD, rate)?;
-        let surplus = if escrow_shares > pt_face_reservation {
-            escrow_shares - pt_face_reservation
-        } else {
-            0
-        };
+        let surplus = junior_surplus(&env, &config, rate)?;
         let pay = if owed < surplus { owed } else { surplus };
 
         // Consume exactly what we pay, then push it. The remainder (owed - pay)
@@ -676,6 +679,17 @@ fn burn_settled_yt(env: &Env, yt_token: &Address, from: &Address, amount: i128, 
 fn pt_total_supply(env: &Env, pt_token: &Address) -> i128 {
     let args: Vec<Val> = vec![env];
     env.invoke_contract(pt_token, &Symbol::new(env, "total_supply"), args)
+}
+
+fn junior_surplus(env: &Env, config: &Config, rate: i128) -> Result<i128, Error> {
+    let escrow_shares = token_balance(env, &config.sy_token, &env.current_contract_address());
+    let pt_supply = pt_total_supply(env, &config.pt_token);
+    let pt_face_reservation = mul_div_ceil(env, pt_supply, WAD, rate)?;
+    Ok(if escrow_shares > pt_face_reservation {
+        escrow_shares - pt_face_reservation
+    } else {
+        0
+    })
 }
 
 /// Reads the live SY rate and records it as the latest pre-maturity

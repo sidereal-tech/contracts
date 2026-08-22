@@ -844,6 +844,12 @@ fn yt_claim_takes_only_the_surplus_over_pt_reservation() {
         surplus,
         owed_before
     );
+    let tokenizer = TokenizerClient::new(&m.env, &m.tokenizer);
+    assert_eq!(
+        tokenizer.available_yield_surplus(),
+        surplus,
+        "the public safe cap must match the independently computed PT surplus"
+    );
 
     let claimed = m.claim(&alice);
     assert_eq!(

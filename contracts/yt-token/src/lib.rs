@@ -202,9 +202,9 @@ impl YtToken {
     /// monotonically with no write-down. A shortfall can therefore leave this
     /// reading a large obligation against an escrow of almost nothing.
     ///
-    /// Consumers must treat it as a claim, not a balance: pay out `min(this,
-    /// what escrow actually holds above the PT reservation)`, never this alone.
-    /// See `total_yield_basis` for the parallel caveat on the other aggregate.
+    /// Consumers must treat it as a claim, not a balance: cap every payout by
+    /// `tokenizer.available_yield_surplus()`, never this value alone. See
+    /// `total_yield_basis` for the parallel caveat on the other aggregate.
     pub fn total_accrued_yield(env: Env) -> Result<i128, Error> {
         Self::read_config(&env)?;
         Ok(Self::read_total_accrued(&env))
