@@ -279,6 +279,27 @@ LPs deposit PT and SY in the current pool ratio and receive LP shares. They earn
 
 For LP positions held to maturity, the exit is three transactions today: `remove_liquidity` on the AMM (which deliberately still works after maturity), `redeem_at_maturity` on the tokenizer for the PT leg, then `redeem` on the SY vault. A single-transaction `zap_out_at_maturity` is *planned, not built* — it exists in no contract and no SDK path. It belongs with the router/rollover work rather than in this section's present tense.
 
+### 4.6 Resting limit orders
+
+Each V2 market deploys an independent PT/SY orderbook beside the AMM. PT is the
+base asset and SY shares are the quote asset. Makers escrow PT for asks or the
+full limit-price SY notional for bids; the contract never relies on an allowance
+remaining valid when somebody later attempts a fill.
+
+Orders live in doubly linked lists sorted by price and then insertion time. A
+maker supplies the intended predecessor, and the contract validates both local
+neighbors before insertion. This keeps placement bounded while making the list
+head the only fillable order, so an indexer may discover and relay orders but
+cannot bypass price-time priority. Marketable orders are rejected: the caller
+fills the best opposite order first and may place any remainder afterward.
+
+Fills may be partial. Quote rounding is computed as the difference between two
+cumulative ceiling quotes, so arbitrary partial-fill sequences telescope to the
+same total quote as one full fill. Makers may cancel at any time, expired head
+orders are permissionlessly prunable, and maturity disables placement/fills but
+never cancellation. A bounded taker fee is adjustable only by the configured
+orderbook admin and every update emits a `FeeSet` event.
+
 ---
 
 ## 5. The TWAP design in detail
