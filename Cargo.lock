@@ -1513,6 +1513,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sidereal-orderbook"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "sidereal-pt-token"
 version = "0.1.0"
 dependencies = [

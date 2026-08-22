@@ -24,6 +24,7 @@ contracts=(
   sidereal_yt_token
   sidereal_tokenizer
   sidereal_amm
+  sidereal_orderbook
 )
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
