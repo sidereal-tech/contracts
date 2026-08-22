@@ -971,6 +971,18 @@ fn withdraw_pays_from_idle_before_it_touches_the_pool() {
     let out = market.vault.redeem(&market.user, &(20 * UNIT), &(20 * UNIT));
     assert_eq!(out, 20 * UNIT, "and withdraw actually delivers it");
     assert_eq!(coin.balance(&market.user), start + 20 * UNIT);
+    assert_eq!(market.vault.total_assets(), 80 * UNIT);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        WAD,
+        "spending donated idle must not raise the rate"
+    );
+    market.pool.set_b_rate(&1_100_000_000_000);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        1_100_000_000_000_000_000,
+        "the excluded position units must keep their future interest out too"
+    );
     assert_eq!(
         coin.balance(&market.strategy.address),
         0,
@@ -999,6 +1011,12 @@ fn max_withdraw_is_exactly_what_a_mixed_idle_and_pool_withdrawal_delivers() {
     let quoted = market.vault.max_withdraw();
     let out = market.vault.redeem(&market.user, &(30 * UNIT), &0);
     assert_eq!(out, quoted, "the quote is the delivery");
+    assert_eq!(market.vault.total_assets(), 70 * UNIT);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        WAD,
+        "mixed idle and pool liquidity must reduce backing with supply"
+    );
 }
 
 /// V1 recomputed the burn from what actually arrived; V2 had regressed to

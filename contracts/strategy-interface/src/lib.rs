@@ -30,15 +30,11 @@
 //!    PT reservation. The V1 wrapper valued only its bToken position for exactly
 //!    this reason; the seam now states it as an obligation.
 //!
-//!    Be precise about what this buys: it stops a donation repricing shares the
-//!    instant it lands, not forever. An adapter that pays redemptions out of
-//!    idle (as `strategy-blend` does, so idle is recoverable rather than
-//!    stranded) burns supply without moving the numerator, so the donation
-//!    reaches the rate at that later moment instead. That is fair — it accrues
-//!    to remaining holders, and donating is always a net loss to the donor —
-//!    but it means the rate is steerable in timing and size by whoever pays
-//!    for it. Adapters must not treat "idle excluded" as making the rate
-//!    unmovable, and consumers of the rate must tolerate a permanent step.
+//!    Exclusion must survive withdrawal too. If an adapter spends unvalued idle
+//!    while the vault burns shares, it must reduce its valued position by the
+//!    same amount; otherwise the smaller denominator turns the donation into a
+//!    delayed rate increase. `strategy-blend` records that reduction as
+//!    excluded supplied assets.
 
 use soroban_sdk::{contractclient, contracterror, Address, Env};
 

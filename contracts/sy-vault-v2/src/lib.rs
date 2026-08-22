@@ -35,28 +35,11 @@
 //!   ever hold the entire supply — the two preconditions of a first-depositor
 //!   inflation attack.
 //!
-//! **What this does NOT give you: an unmovable rate.** Excluding idle stops a
-//! donation from repricing shares *the instant it lands*; it does not stop it
-//! from landing later. `strategy-blend::withdraw` pays a redemption out of idle
-//! first, and idle is not in `total_assets` — so a redemption served from idle
-//! burns supply while the numerator does not move, and the rate steps up by the
-//! donation at that moment. Measured: donate 20 into a 100 market, redeem 20,
-//! rate goes 1.00 -> 1.25 permanently, and both legs fit in one transaction.
-//!
-//! That is deferred crediting, not theft, and the exploit half stays closed:
-//! the donor's recapture is bounded by their share of supply plus their share
-//! of escrow, which `MINIMUM_SHARES` keeps strictly below one, so donating is
-//! always a net loss (measured at -303 of a 500 donation, and at -0.10 for a
-//! whale owning the entire float). PT stays covered throughout.
-//!
-//! The consequence to design around is that `exchange_rate` is a *steerable*
-//! oracle, cheaply so for a dominant holder — the cost is
-//! `donation x (1 - their post-burn share of supply)` — and the step is
-//! permanent, so a TWAP downstream does not blunt it. Anything that prices off
-//! this rate (the AMM curve reads it directly) must be able to withstand an
-//! attacker-chosen upward step, and an accidental transfer to the strategy is
-//! no longer inert: it lands as an uncontrolled rate step at an arbitrary
-//! moment, which `observe_rate` can record and the maturity freeze can pin.
+//! Excluding idle must remain true after a redemption uses it. The Blend
+//! strategy records every unit of unvalued idle it spends as an equal exclusion
+//! from its supplied position, so `total_assets` and share supply fall together.
+//! A donation can provide temporary liquidity, but it cannot create a delayed
+//! exchange-rate step for the AMM or maturity freeze to observe.
 
 use sidereal_shared_types::StandardizedYield;
 use sidereal_strategy_interface::{derived_exchange_rate, YieldStrategyClient, WAD};
