@@ -157,11 +157,10 @@ impl Tokenizer {
         // and taking them as parameters would invert the dependency (the AMM
         // names the tokenizer, not the reverse). `scripts/deploy-market.sh`
         // carries the check for those, where all the addresses are in hand.
-        if yield_fee_bps > 0
-            && (fee_recipient == env.current_contract_address()
-                || fee_recipient == sy_token
-                || fee_recipient == pt_token
-                || fee_recipient == yt_token)
+        if fee_recipient == env.current_contract_address()
+            || fee_recipient == sy_token
+            || fee_recipient == pt_token
+            || fee_recipient == yt_token
         {
             return Err(Error::InvalidFeeRecipient);
         }
@@ -195,18 +194,10 @@ impl Tokenizer {
             return Err(Error::InvalidFee);
         }
 
-        // Re-run `initialize`'s recipient guard. That check is gated on the fee
-        // actually being charged, so a market opened at 0 bps is allowed to name
-        // a recipient the guard would otherwise reject -- including this
-        // contract itself. Without this, raising the fee here would walk such a
-        // market straight into the hazard `InvalidFeeRecipient` exists to
-        // prevent: `escrow_out == ledger_debit` broken by a self-transfer, or
-        // the fee stranded in one of this market's own tokens.
-        //
-        // `fee_recipient` is still immutable, so this fails closed rather than
-        // offering a way out: a 0 bps market that named a bad recipient can
-        // never charge a fee. That is the intended trade for keeping the
-        // recipient fixed at initialization.
+        // Defensive upgrade guard for state created before `initialize`
+        // validated recipients unconditionally. A legacy zero-fee market with
+        // an unsafe permanent recipient must never be reactivated by raising
+        // the fee after a Wasm upgrade.
         if yield_fee_bps > 0
             && (config.fee_recipient == env.current_contract_address()
                 || config.fee_recipient == config.sy_token
@@ -960,27 +951,33 @@ mod test {
     }
 
     #[test]
-    fn a_fee_free_market_may_name_any_recipient() {
-        // At 0 bps nothing is ever pushed, so the guard would only add a
-        // deploy-time failure with no corresponding hazard. Name the tokenizer
-        // itself — the address the guard rejects above — to pin that the check
-        // is gated on the fee actually being charged.
-        //
-        // Since `set_fee` exists, such a market is not merely fee-free but
-        // permanently so: raising the fee re-runs the recipient guard and
-        // fails. That is deliberate: it fails closed. See
-        // `raising_the_fee_revalidates_the_recipient`.
-        let fixture = fixture(NOW);
-        fixture.client.initialize(
-            &fixture.admin,
-            &fixture.sy_token,
-            &fixture.pt_token,
-            &fixture.yt_token,
-            &MATURITY,
-            &fixture.client.address,
-            &0_i128,
-        );
-        assert_eq!(fixture.client.config().yield_fee_bps, 0);
+    fn a_fee_free_market_still_rejects_an_unsafe_recipient() {
+        // The fee is admin-mutable while its recipient is permanent. Accepting
+        // a bad recipient at 0 bps would only defer the failure until the admin
+        // turns the fee on, so recipient validity cannot depend on the opening
+        // fee.
+        for which in ["self", "sy", "pt", "yt"] {
+            let fixture = fixture(NOW);
+            let target = match which {
+                "self" => fixture.client.address.clone(),
+                "sy" => fixture.sy_token.clone(),
+                "pt" => fixture.pt_token.clone(),
+                _ => fixture.yt_token.clone(),
+            };
+            assert_eq!(
+                fixture.client.try_initialize(
+                    &fixture.admin,
+                    &fixture.sy_token,
+                    &fixture.pt_token,
+                    &fixture.yt_token,
+                    &MATURITY,
+                    &target,
+                    &0_i128,
+                ),
+                Err(Ok(Error::InvalidFeeRecipient)),
+                "a zero-fee market must still reject its {which} address"
+            );
+        }
     }
 
     #[test]
@@ -1041,41 +1038,6 @@ mod test {
         let fixture = fixture(NOW);
         initialize(&fixture);
         fixture.client.set_fee(&fixture.admin, &-1);
-    }
-
-    #[test]
-    fn raising_the_fee_revalidates_the_recipient() {
-        // The merge that brought `set_fee` in met a recipient guard gated on
-        // `yield_fee_bps > 0`. A market opened at 0 bps may legally name a
-        // recipient the guard rejects, so without revalidation here, one
-        // `set_fee` call would reopen the exact hole the guard closed.
-        //
-        // Assert the CODE: with `is_err()` alone this passes on NotAdmin.
-        for which in ["self", "sy", "pt", "yt"] {
-            let fixture = fixture(NOW);
-            let target = match which {
-                "self" => fixture.client.address.clone(),
-                "sy" => fixture.sy_token.clone(),
-                "pt" => fixture.pt_token.clone(),
-                _ => fixture.yt_token.clone(),
-            };
-            fixture.client.initialize(
-                &fixture.admin,
-                &fixture.sy_token,
-                &fixture.pt_token,
-                &fixture.yt_token,
-                &MATURITY,
-                &target,
-                &0_i128,
-            );
-            assert_eq!(
-                fixture.client.try_set_fee(&fixture.admin, &500),
-                Err(Ok(Error::InvalidFeeRecipient)),
-                "raising the fee must refuse a {which} recipient"
-            );
-            // The rejection must not have been recorded.
-            assert_eq!(fixture.client.config().yield_fee_bps, 0);
-        }
     }
 
     #[test]

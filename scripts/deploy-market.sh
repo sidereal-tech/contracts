@@ -339,17 +339,16 @@ invoke_once INIT_YT "$YT" initialize --admin "$DEPLOYER_ADDRESS" --tokenizer "$T
 # the fee at the AMM would make every claim an unpriced LP donation that
 # `reconcile_reserves` absorbs, which also nudges the implied-rate oracle;
 # pointing it at the strategy or the underlying strands the shares outright.
-# `fee_recipient` is immutable after the next call, so this is the last check
-# that can ever run.
-if [[ "$YIELD_FEE_BPS" != "0" ]]; then
-  for reserved in "$TK:tokenizer" "$SY:SY vault" "$PT:PT token" "$YT:YT token" \
-                  "$AMM:AMM" "$STRATEGY:strategy" "$UNDERLYING_ID:underlying token"; do
-    addr="${reserved%%:*}"; what="${reserved#*:}"
-    if [[ -n "$addr" && "$FEE_RECIPIENT" == "$addr" ]]; then
-      die "FEE_RECIPIENT is this market's $what ($addr); the fee would be stranded or silently donated, and it cannot be changed after deploy"
-    fi
-  done
-fi
+# `fee_recipient` is immutable, while both fees may be raised from zero later,
+# so this check must not depend on either opening fee being nonzero.
+for reserved in "$TK:tokenizer" "$SY:SY vault" "$PT:PT token" "$YT:YT token" \
+                "$AMM:AMM" "$ORDERBOOK:orderbook" "$STRATEGY:strategy" \
+                "$UNDERLYING_ID:underlying token"; do
+  addr="${reserved%%:*}"; what="${reserved#*:}"
+  if [[ -n "$addr" && "$FEE_RECIPIENT" == "$addr" ]]; then
+    die "FEE_RECIPIENT is this market's $what ($addr); a future fee would be stranded or silently donated, and the recipient cannot be changed after deploy"
+  fi
+done
 
 log "Initializing tokenizer"
 invoke_once INIT_TK "$TK" initialize --admin "$DEPLOYER_ADDRESS" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" \
@@ -376,19 +375,15 @@ invoke_once INIT_ORDERBOOK "$ORDERBOOK" initialize \
   --maturity "$MATURITY" \
   --fee_recipient "$FEE_RECIPIENT" \
   --taker_fee_bps "$ORDERBOOK_FEE_BPS"
-# PT, YT, the tokenizer and the AMM each store their own copy of `maturity`,
+# PT, YT, the tokenizer, the AMM and the orderbook each store their own copy of `maturity`,
 # and nothing on-chain cross-checks them. A mismatch is silent at deploy and
 # then bricks every YT transfer and burn inside the gap window, because YT picks
 # observe-vs-freeze off its own copy while the tokenizer validates against its.
 # They all receive one $MATURITY above, so this only fires if a future edit
 # splits them -- which is exactly when nobody would be looking.
 #
-# GAP, recorded rather than left implicit: the orderbook is a fifth contract
-# with its own `maturity` copy (initialized above) and is NOT covered here. It
-# exposes no `maturity()` getter -- only `config()` -- so it cannot join this
-# loop without a contract change. Adding that getter would close the gap.
-log "Verifying PT, YT, tokenizer and AMM agree on maturity"
-for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM"; do
+log "Verifying PT, YT, tokenizer, AMM and orderbook agree on maturity"
+for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM" "orderbook:$ORDERBOOK"; do
   name="${pair%%:*}"; id="${pair#*:}"
   # Check the invoke's STATUS, not just its text. An earlier version used
   # `|| true` with `2>&1`, which threw the status away and folded stderr into
@@ -406,7 +401,7 @@ for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM"; do
     die "$name reports maturity $got, expected $MATURITY -- refusing to record a market whose contracts disagree"
   fi
 done
-log "  all four agree on $MATURITY (orderbook not cross-checked; see above)"
+log "  all five agree on $MATURITY"
 
 log "Verifying deployed bytecode matches the local build"
 STRATEGY_CHAIN_HASH="$(onchain_hash "$STRATEGY")"
