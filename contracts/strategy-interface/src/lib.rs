@@ -29,6 +29,12 @@
 //!    first-depositor inflation vector straight through to the tokenizer's
 //!    PT reservation. The V1 wrapper valued only its bToken position for exactly
 //!    this reason; the seam now states it as an obligation.
+//!
+//!    Exclusion must survive withdrawal too. If an adapter spends unvalued idle
+//!    while the vault burns shares, it must reduce its valued position by the
+//!    same amount; otherwise the smaller denominator turns the donation into a
+//!    delayed rate increase. `strategy-blend` records that reduction as
+//!    excluded supplied assets.
 
 use soroban_sdk::{contractclient, contracterror, Address, Env};
 

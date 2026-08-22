@@ -59,6 +59,15 @@ DEPOSIT_CAP="${DEPOSIT_CAP:-0}"
 # Defaults to 0: a market deploys fee-free unless someone decides otherwise, and
 # the decision is explicit rather than inherited from a script default. The
 # contract rejects anything above 20%.
+#
+# Remember whether the operator set these EXPLICITLY, before defaults or a
+# resumed state file overwrite them. Persisting the fee fixed a manifest that
+# lied on resume, but a plain `source` then made the stored value win even while
+# the tokenizer was still uninitialized -- which is the one window where an
+# immutable parameter is still correctable. An operator retrying a crashed
+# deploy to fix a typo'd recipient would have had the typo silently reinstated.
+YIELD_FEE_BPS_ENV="${YIELD_FEE_BPS-}"
+FEE_RECIPIENT_ENV="${FEE_RECIPIENT-}"
 YIELD_FEE_BPS="${YIELD_FEE_BPS:-0}"
 # Taker fee on resting-order fills. The orderbook admin may update it later,
 # subject to the contract's 10% ceiling. Defaults to fee-free.
@@ -218,6 +227,37 @@ if [[ -n "${SOURCE_COMMIT:-}" && "$SOURCE_COMMIT" != "$CURRENT_SOURCE_COMMIT" ]]
   die "state was created from $SOURCE_COMMIT, but current source is $CURRENT_SOURCE_COMMIT"
 fi
 SOURCE_COMMIT="$CURRENT_SOURCE_COMMIT"
+
+# Fee reconciliation, following the SOURCE_COMMIT precedent above. Which source
+# wins depends on whether the tokenizer has been initialized. `fee_recipient`
+# becomes immutable then; `yield_fee_bps` remains admin-settable on-chain, but
+# this deploy script records the opening value and never disguises a resumed
+# deployment as a fee-management action:
+#
+#   INIT_TK != 1 -- still mutable. An explicit env value WINS, so an operator
+#                   retrying a crashed deploy can correct a typo.
+#   INIT_TK == 1 -- opening values are already on chain. A conflicting env
+#                   value is fatal rather than silently ignored or applied.
+#                   Use tokenizer.set_fee separately for a live fee change;
+#                   fee_recipient cannot be changed at all.
+if [[ "${INIT_TK:-0}" == "1" ]]; then
+  if [[ -n "$YIELD_FEE_BPS_ENV" && "$YIELD_FEE_BPS_ENV" != "$YIELD_FEE_BPS" ]]; then
+    die "tokenizer opened with yield_fee_bps=$YIELD_FEE_BPS; a resumed deploy will not change it to $YIELD_FEE_BPS_ENV -- use tokenizer.set_fee after deployment"
+  fi
+  if [[ -n "$FEE_RECIPIENT_ENV" && "$FEE_RECIPIENT_ENV" != "${FEE_RECIPIENT:-}" ]]; then
+    die "tokenizer is already initialized with fee_recipient=${FEE_RECIPIENT:-}; it is immutable and cannot be changed to $FEE_RECIPIENT_ENV"
+  fi
+else
+  if [[ -n "$YIELD_FEE_BPS_ENV" && "$YIELD_FEE_BPS_ENV" != "$YIELD_FEE_BPS" ]]; then
+    warn "overriding stored yield_fee_bps=$YIELD_FEE_BPS with $YIELD_FEE_BPS_ENV (tokenizer not yet initialized)"
+    YIELD_FEE_BPS="$YIELD_FEE_BPS_ENV"
+  fi
+  if [[ -n "$FEE_RECIPIENT_ENV" && "$FEE_RECIPIENT_ENV" != "${FEE_RECIPIENT:-}" ]]; then
+    warn "overriding stored fee_recipient=${FEE_RECIPIENT:-} with $FEE_RECIPIENT_ENV (tokenizer not yet initialized)"
+    FEE_RECIPIENT="$FEE_RECIPIENT_ENV"
+  fi
+fi
+
 DEPLOY_STARTED_AT="${DEPLOY_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 MARKET_LABEL="${MARKET_LABEL:-Blend v2 USDC}"
@@ -293,6 +333,23 @@ invoke_once INIT_PT "$PT" initialize --admin "$DEPLOYER_ADDRESS" --tokenizer "$T
 log "Initializing YT token"
 invoke_once INIT_YT "$YT" initialize --admin "$DEPLOYER_ADDRESS" --tokenizer "$TK" --sy_token "$SY" --maturity "$MATURITY"
 
+# The tokenizer rejects a fee_recipient it can see -- itself, and the three
+# tokens passed to `initialize`. It cannot see the AMM or the strategy, because
+# it is never told their addresses, so those have to be caught here. Pointing
+# the fee at the AMM would make every claim an unpriced LP donation that
+# `reconcile_reserves` absorbs, which also nudges the implied-rate oracle;
+# pointing it at the strategy or the underlying strands the shares outright.
+# `fee_recipient` is immutable, while both fees may be raised from zero later,
+# so this check must not depend on either opening fee being nonzero.
+for reserved in "$TK:tokenizer" "$SY:SY vault" "$PT:PT token" "$YT:YT token" \
+                "$AMM:AMM" "$ORDERBOOK:orderbook" "$STRATEGY:strategy" \
+                "$UNDERLYING_ID:underlying token"; do
+  addr="${reserved%%:*}"; what="${reserved#*:}"
+  if [[ -n "$addr" && "$FEE_RECIPIENT" == "$addr" ]]; then
+    die "FEE_RECIPIENT is this market's $what ($addr); a future fee would be stranded or silently donated, and the recipient cannot be changed after deploy"
+  fi
+done
+
 log "Initializing tokenizer"
 invoke_once INIT_TK "$TK" initialize --admin "$DEPLOYER_ADDRESS" --sy_token "$SY" --pt_token "$PT" --yt_token "$YT" --maturity "$MATURITY" \
   --fee_recipient "$FEE_RECIPIENT" --yield_fee_bps "$YIELD_FEE_BPS"
@@ -318,6 +375,33 @@ invoke_once INIT_ORDERBOOK "$ORDERBOOK" initialize \
   --maturity "$MATURITY" \
   --fee_recipient "$FEE_RECIPIENT" \
   --taker_fee_bps "$ORDERBOOK_FEE_BPS"
+# PT, YT, the tokenizer, the AMM and the orderbook each store their own copy of `maturity`,
+# and nothing on-chain cross-checks them. A mismatch is silent at deploy and
+# then bricks every YT transfer and burn inside the gap window, because YT picks
+# observe-vs-freeze off its own copy while the tokenizer validates against its.
+# They all receive one $MATURITY above, so this only fires if a future edit
+# splits them -- which is exactly when nobody would be looking.
+#
+log "Verifying PT, YT, tokenizer, AMM and orderbook agree on maturity"
+for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM" "orderbook:$ORDERBOOK"; do
+  name="${pair%%:*}"; id="${pair#*:}"
+  # Check the invoke's STATUS, not just its text. An earlier version used
+  # `|| true` with `2>&1`, which threw the status away and folded stderr into
+  # the value -- so a call that printed the right number and then failed passed
+  # the check, and a failure whose last stderr line happened to be the number
+  # passed it too. Keep stderr separate, and report it if the call fails.
+  err_file="$(mktemp)"
+  if ! got="$(stellar contract invoke --id "$id" --source "$IDENTITY" --network "$NETWORK" --send=no -- maturity 2>"$err_file")"; then
+    err_text="$(cat "$err_file")"; rm -f "$err_file"
+    die "$name: reading maturity failed: $err_text"
+  fi
+  rm -f "$err_file"
+  got="$(printf '%s' "$got" | tr -d '"' | tail -1)"
+  if [[ "$got" != "$MATURITY" ]]; then
+    die "$name reports maturity $got, expected $MATURITY -- refusing to record a market whose contracts disagree"
+  fi
+done
+log "  all five agree on $MATURITY"
 
 log "Verifying deployed bytecode matches the local build"
 STRATEGY_CHAIN_HASH="$(onchain_hash "$STRATEGY")"
@@ -383,6 +467,16 @@ initial_anchor = "$INITIAL_ANCHOR"
 fee_bps = $FEE_BPS
 twap_window = $TWAP_WINDOW
 
+# The protocol's cut of claimed yield, and where it is paid. \`recipient\` is
+# fixed at the tokenizer's initialization and can never be changed for this
+# market. \`yield_fee_bps\` is the value set at deploy; it is admin-mutable via
+# \`tokenizer.set_fee\`, so treat this as the market's opening fee rather than a
+# permanent one, and read \`tokenizer.config()\` on chain for the current value.
+# Recorded here because a mis-entered value would otherwise leave no artifact
+# anywhere else.
+[fee]
+yield_fee_bps = $YIELD_FEE_BPS
+recipient = "$FEE_RECIPIENT"
 [orderbook]
 taker_fee_bps = $ORDERBOOK_FEE_BPS
 fee_recipient = "$FEE_RECIPIENT"

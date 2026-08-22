@@ -30,7 +30,8 @@
 //! only from the vault fixed at init, and both return *measured deltas*.
 
 use sidereal_blend_adapter::{
-    assets_from_b_tokens, BlendPoolClient, Request, REQUEST_SUPPLY, REQUEST_WITHDRAW,
+    assets_from_b_tokens, BlendPoolClient, Request, BLEND_SCALAR_12, REQUEST_SUPPLY,
+    REQUEST_WITHDRAW,
 };
 use sidereal_strategy_interface::StrategyError;
 use soroban_sdk::{
@@ -68,6 +69,10 @@ pub struct Config {
 #[contracttype]
 enum DataKey {
     Config,
+    /// bTokens economically replaced by unvalued idle donations during
+    /// withdrawals. Tracking position units, rather than a fixed asset amount,
+    /// keeps their future interest excluded too.
+    ExcludedBTokens,
 }
 
 #[contractevent]
@@ -127,6 +132,7 @@ impl StrategyBlend {
                 reserve_index,
             },
         );
+        env.storage().instance().set(&DataKey::ExcludedBTokens, &0_i128);
         Self::bump_instance_ttl(&env);
         Ok(())
     }
@@ -153,9 +159,9 @@ impl StrategyBlend {
     ///   to value: any address can put it there with a plain SAC transfer, so
     ///   including it would make the vault's exchange rate — and through it the
     ///   tokenizer's PT reservation — a function of an unauthorized token
-    ///   transfer. `withdraw` still pays it out (idle first), so a donation is
-    ///   recoverable rather than stranded; it simply accrues to the holders who
-    ///   remain instead of repricing everyone's shares the instant it lands.
+    ///   transfer. `withdraw` may use idle as liquidity, but records the same
+    ///   amount as excluded supplied assets. The numerator therefore falls with
+    ///   the burned supply and the donation can never reprice remaining shares.
     /// - **BLND emissions**, which this strategy never claims or converts. A
     ///   reward token the position cannot presently redeem must not move the
     ///   exchange rate.
@@ -175,10 +181,10 @@ impl StrategyBlend {
     pub fn max_withdraw(env: Env) -> i128 {
         let config = Self::config_or_panic(&env);
         let idle = Self::idle_balance(&env, &config.underlying);
-        let supplied = Self::supplied_assets(&env, &config);
+        let valued = Self::assets_of(&env, &config);
         let pool_liquidity = token::TokenClient::new(&env, &config.underlying).balance(&config.pool);
-        let realizable = if supplied < pool_liquidity {
-            supplied
+        let realizable = if valued < pool_liquidity {
+            valued
         } else {
             pool_liquidity
         };
@@ -186,10 +192,10 @@ impl StrategyBlend {
             Some(value) => value,
             None => panic_with_error!(&env, StrategyError::MathOverflow),
         };
-        if deliverable < supplied {
+        if deliverable < valued {
             deliverable
         } else {
-            supplied
+            valued
         }
     }
 
@@ -246,7 +252,10 @@ impl StrategyBlend {
     /// reported liquidity it could never deliver and stranded the balance
     /// permanently. Spending it first also settles the only route by which a
     /// donation can reach the vault: it leaves as underlying to a redeemer
-    /// instead of sitting unspendable.
+    /// instead of sitting unspendable. Every unit of unvalued idle spent is
+    /// simultaneously recorded as excluded supplied assets. This keeps
+    /// `total_assets` falling one-for-one with the vault's burn instead of
+    /// turning the donation into a permanent upward rate step.
     ///
     /// Returns the underlying actually delivered, which may be less than
     /// `amount` when the pool is short. `min_underlying_out` is the caller's
@@ -300,6 +309,10 @@ impl StrategyBlend {
         }
         if delivered < min_underlying_out {
             panic_with_error!(&env, StrategyError::SlippageExceeded);
+        }
+
+        if idle_used > 0 {
+            Self::exclude_idle_assets(&env, &config, idle_used);
         }
 
         Self::push_underlying(&env, &config.underlying, &vault, delivered);
@@ -405,26 +418,63 @@ impl StrategyBlend {
         token::TokenClient::new(env, underlying).balance(&env.current_contract_address())
     }
 
-    /// The supplied position's value at Blend's live `b_rate`, with the
-    /// reserve-index check that refuses to price the wrong reserve.
-    fn supplied_assets(env: &Env, config: &Config) -> i128 {
+    fn read_excluded_b_tokens(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExcludedBTokens)
+            .unwrap_or(0)
+    }
+
+    fn exclude_idle_assets(env: &Env, config: &Config, amount: i128) {
         let pool_client = BlendPoolClient::new(env, &config.pool);
         let positions = pool_client.get_positions(&env.current_contract_address());
-        let b_tokens = positions.supply.get(config.reserve_index).unwrap_or(0);
+        let total_b_tokens = positions.supply.get(config.reserve_index).unwrap_or(0);
+        let reserve = pool_client.get_reserve(&config.underlying);
+        if reserve.config.index != config.reserve_index || reserve.data.b_rate <= 0 {
+            panic_with_error!(env, StrategyError::UpstreamMismatch);
+        }
+        let product = match amount.checked_mul(BLEND_SCALAR_12) {
+            Some(value) => value,
+            None => panic_with_error!(env, StrategyError::MathOverflow),
+        };
+        let mut newly_excluded = product / reserve.data.b_rate;
+        if product % reserve.data.b_rate != 0 {
+            newly_excluded = match newly_excluded.checked_add(1) {
+                Some(value) => value,
+                None => panic_with_error!(env, StrategyError::MathOverflow),
+            };
+        }
+        let excluded = Self::read_excluded_b_tokens(env);
+        let next = match excluded.checked_add(newly_excluded) {
+            Some(value) if value <= total_b_tokens => value,
+            Some(_) => total_b_tokens,
+            None => panic_with_error!(env, StrategyError::MathOverflow),
+        };
+        env.storage().instance().set(&DataKey::ExcludedBTokens, &next);
+    }
+
+    /// The valuation the vault mints and prices against: the supplied position,
+    /// less any portion economically replaced by an unvalued idle donation.
+    /// See `total_assets` for why both raw idle and its later withdrawal must
+    /// stay outside the rate.
+    fn assets_of(env: &Env, config: &Config) -> i128 {
+        let pool_client = BlendPoolClient::new(env, &config.pool);
+        let positions = pool_client.get_positions(&env.current_contract_address());
+        let total_b_tokens = positions.supply.get(config.reserve_index).unwrap_or(0);
         let reserve = pool_client.get_reserve(&config.underlying);
         if reserve.config.index != config.reserve_index {
             panic_with_error!(env, StrategyError::UpstreamMismatch);
         }
-        match assets_from_b_tokens(b_tokens, reserve.data.b_rate) {
+        let excluded = Self::read_excluded_b_tokens(env);
+        let valued_b_tokens = if total_b_tokens > excluded {
+            total_b_tokens - excluded
+        } else {
+            0
+        };
+        match assets_from_b_tokens(valued_b_tokens, reserve.data.b_rate) {
             Some(value) => value,
             None => panic_with_error!(env, StrategyError::MathOverflow),
         }
-    }
-
-    /// The valuation the vault mints and prices against: the supplied position
-    /// only. See `total_assets` for why idle is excluded.
-    fn assets_of(env: &Env, config: &Config) -> i128 {
-        Self::supplied_assets(env, config)
     }
 
     /// Submits one plain-supply or withdraw request as this strategy. The

@@ -91,6 +91,14 @@ pub enum Error {
     InvalidFee = 10,
     /// Caller is not the admin recorded at initialization.
     NotAdmin = 11,
+    /// A fee-bearing market named a `fee_recipient` that would break the
+    /// `escrow_out == ledger_debit` identity (the tokenizer itself) or strand
+    /// the fee in a contract that cannot move it (one of this market's tokens).
+    ///
+    /// Numbered 12 rather than 11: both sides of the merge that introduced this
+    /// claimed 11, and `NotAdmin` was already published on main with recorded
+    /// snapshots, so it keeps the lower code.
+    InvalidFeeRecipient = 12,
 }
 
 #[contractevent]
@@ -133,6 +141,30 @@ impl Tokenizer {
             return Err(Error::InvalidFee);
         }
 
+        // Reject recipients that break the accounting identity the fee relies
+        // on: `escrow_out == ledger_debit`. Paying the tokenizer itself makes
+        // the push a self-transfer, so the YT ledger is debited the gross while
+        // only the net actually leaves escrow — the difference is not lost, but
+        // it silently inflates the next claimant's surplus and the apparent PT
+        // coverage, unattributed. Paying a token in this market strands the
+        // shares in a contract that cannot move them. This is the last moment
+        // either can be caught: `fee_recipient` is immutable after this call.
+        //
+        // Scope, deliberately: these are the addresses this signature can see.
+        // The strategy and the underlying token strand the fee just as
+        // completely, and the AMM would absorb it into LP reserves via
+        // `reconcile_reserves` — but the tokenizer is never told any of them,
+        // and taking them as parameters would invert the dependency (the AMM
+        // names the tokenizer, not the reverse). `scripts/deploy-market.sh`
+        // carries the check for those, where all the addresses are in hand.
+        if fee_recipient == env.current_contract_address()
+            || fee_recipient == sy_token
+            || fee_recipient == pt_token
+            || fee_recipient == yt_token
+        {
+            return Err(Error::InvalidFeeRecipient);
+        }
+
         let config = Config {
             admin,
             sy_token,
@@ -160,6 +192,19 @@ impl Tokenizer {
         }
         if !(0..=MAX_YIELD_FEE_BPS).contains(&yield_fee_bps) {
             return Err(Error::InvalidFee);
+        }
+
+        // Defensive upgrade guard for state created before `initialize`
+        // validated recipients unconditionally. A legacy zero-fee market with
+        // an unsafe permanent recipient must never be reactivated by raising
+        // the fee after a Wasm upgrade.
+        if yield_fee_bps > 0
+            && (config.fee_recipient == env.current_contract_address()
+                || config.fee_recipient == config.sy_token
+                || config.fee_recipient == config.pt_token
+                || config.fee_recipient == config.yt_token)
+        {
+            return Err(Error::InvalidFeeRecipient);
         }
 
         let old_fee_bps = config.yield_fee_bps;
@@ -406,6 +451,17 @@ impl Tokenizer {
         Ok(sy_to_pay)
     }
 
+    /// SY shares presently available to all junior YT claims after reserving
+    /// enough escrow for every outstanding PT. This is the payout cap future
+    /// sweep or pro-rata logic must use; YT's aggregate basis/accrual views are
+    /// obligations and can exceed what escrow can actually pay after a loss or
+    /// redemption.
+    pub fn available_yield_surplus(env: Env) -> Result<i128, Error> {
+        let config = Self::read_config(&env)?;
+        let rate = effective_rate(&env, &config);
+        junior_surplus(&env, &config, rate)
+    }
+
     /// Pays `holder` their accrued YT yield in SY out of escrow, capped so PT
     /// principal is always senior to banked YT yield, and returns the SY amount
     /// the holder actually received — net of `yield_fee_bps`. Allowed any time,
@@ -453,15 +509,7 @@ impl Tokenizer {
         // face at `rate` (rounded UP so PT is never shorted), and pay YT only out
         // of the remainder. `escrow_shares` and `pt_supply` are read the same way
         // `redeem_at_maturity` reads them.
-        let escrow_shares =
-            token_balance(&env, &config.sy_token, &env.current_contract_address());
-        let pt_supply = pt_total_supply(&env, &config.pt_token);
-        let pt_face_reservation = mul_div_ceil(&env, pt_supply, WAD, rate)?;
-        let surplus = if escrow_shares > pt_face_reservation {
-            escrow_shares - pt_face_reservation
-        } else {
-            0
-        };
+        let surplus = junior_surplus(&env, &config, rate)?;
         let pay = if owed < surplus { owed } else { surplus };
 
         // Consume exactly what we pay, then push it. The remainder (owed - pay)
@@ -631,6 +679,17 @@ fn burn_settled_yt(env: &Env, yt_token: &Address, from: &Address, amount: i128, 
 fn pt_total_supply(env: &Env, pt_token: &Address) -> i128 {
     let args: Vec<Val> = vec![env];
     env.invoke_contract(pt_token, &Symbol::new(env, "total_supply"), args)
+}
+
+fn junior_surplus(env: &Env, config: &Config, rate: i128) -> Result<i128, Error> {
+    let escrow_shares = token_balance(env, &config.sy_token, &env.current_contract_address());
+    let pt_supply = pt_total_supply(env, &config.pt_token);
+    let pt_face_reservation = mul_div_ceil(env, pt_supply, WAD, rate)?;
+    Ok(if escrow_shares > pt_face_reservation {
+        escrow_shares - pt_face_reservation
+    } else {
+        0
+    })
 }
 
 /// Reads the live SY rate and records it as the latest pre-maturity
@@ -857,6 +916,106 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn a_fee_market_cannot_pay_itself() {
+        // Paying the tokenizer would make the fee push a self-transfer: the YT
+        // ledger debits the gross while only the net leaves escrow, quietly
+        // breaking escrow_out == ledger_debit.
+        let fixture = fixture(NOW);
+        fixture.client.initialize(
+            &fixture.admin,
+            &fixture.sy_token,
+            &fixture.pt_token,
+            &fixture.yt_token,
+            &MATURITY,
+            &fixture.client.address,
+            &500_i128,
+        );
+    }
+
+    #[test]
+    fn a_fee_market_cannot_pay_one_of_its_own_tokens() {
+        // Shares sent to PT/YT/SY are stranded — none of those contracts can
+        // move an SY balance back out. All three clauses are exercised: with
+        // only one covered, deleting either of the others left the suite green.
+        for which in ["sy", "pt", "yt"] {
+            let fixture = fixture(NOW);
+            let target = match which {
+                "sy" => fixture.sy_token.clone(),
+                "pt" => fixture.pt_token.clone(),
+                _ => fixture.yt_token.clone(),
+            };
+            let result = fixture.client.try_initialize(
+                &fixture.admin,
+                &fixture.sy_token,
+                &fixture.pt_token,
+                &fixture.yt_token,
+                &MATURITY,
+                &target,
+                &500_i128,
+            );
+            // Assert the CODE, not just that it failed: with `is_err()` alone,
+            // changing the guard to return InvalidFee left this test green.
+            assert_eq!(
+                result,
+                Err(Ok(Error::InvalidFeeRecipient)),
+                "a fee market must refuse to pay its own {which} token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fee_free_market_still_rejects_an_unsafe_recipient() {
+        // The fee is admin-mutable while its recipient is permanent. Accepting
+        // a bad recipient at 0 bps would only defer the failure until the admin
+        // turns the fee on, so recipient validity cannot depend on the opening
+        // fee.
+        for which in ["self", "sy", "pt", "yt"] {
+            let fixture = fixture(NOW);
+            let target = match which {
+                "self" => fixture.client.address.clone(),
+                "sy" => fixture.sy_token.clone(),
+                "pt" => fixture.pt_token.clone(),
+                _ => fixture.yt_token.clone(),
+            };
+            assert_eq!(
+                fixture.client.try_initialize(
+                    &fixture.admin,
+                    &fixture.sy_token,
+                    &fixture.pt_token,
+                    &fixture.yt_token,
+                    &MATURITY,
+                    &target,
+                    &0_i128,
+                ),
+                Err(Ok(Error::InvalidFeeRecipient)),
+                "a zero-fee market must still reject its {which} address"
+            );
+        }
+    }
+
+    #[test]
+    fn reinitialize_cannot_reprice_a_live_market() {
+        // Carried over from `there_is_no_fee_setter`, retired in the merge that
+        // brought `set_fee` in: the "no setter" premise is gone, but the
+        // re-initialization route to a different fee is still closed.
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, 500);
+        assert_eq!(fixture.client.config().yield_fee_bps, 500);
+        let repeat = fixture.client.try_initialize(
+            &fixture.admin,
+            &fixture.sy_token,
+            &fixture.pt_token,
+            &fixture.yt_token,
+            &MATURITY,
+            &fixture.fee_recipient,
+            &0_i128,
+        );
+        assert!(repeat.is_err(), "a second initialize must not reprice a live market");
+        assert_eq!(fixture.client.config().yield_fee_bps, 500);
+    }
+
+    #[test]
     fn admin_can_update_yield_fee() {
         let fixture = fixture(NOW);
         initialize_with_fee(&fixture, 500);
@@ -893,6 +1052,16 @@ mod test {
         let fixture = fixture(NOW);
         initialize(&fixture);
         fixture.client.set_fee(&fixture.admin, &-1);
+    }
+
+    #[test]
+    fn a_good_recipient_still_admits_a_raise_from_zero() {
+        // Guards the clause above from over-firing: the same 0 bps -> 500 path
+        // must succeed whenever the recipient is a plain address.
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.admin, &500);
+        assert_eq!(fixture.client.config().yield_fee_bps, 500);
     }
 
     #[test]

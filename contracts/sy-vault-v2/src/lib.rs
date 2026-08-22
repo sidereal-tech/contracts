@@ -34,6 +34,12 @@
 //!   re-bootstrapped at `WAD` against a residual position, and no depositor can
 //!   ever hold the entire supply — the two preconditions of a first-depositor
 //!   inflation attack.
+//!
+//! Excluding idle must remain true after a redemption uses it. The Blend
+//! strategy records every unit of unvalued idle it spends as an equal exclusion
+//! from its supplied position, so `total_assets` and share supply fall together.
+//! A donation can provide temporary liquidity, but it cannot create a delayed
+//! exchange-rate step for the AMM or maturity freeze to observe.
 
 use sidereal_shared_types::StandardizedYield;
 use sidereal_strategy_interface::{derived_exchange_rate, YieldStrategyClient, WAD};
@@ -283,12 +289,54 @@ impl SyVaultV2 {
     /// On an empty market this subtracts the [`MINIMUM_SHARES`] the first
     /// deposit locks away, so the quote is what the depositor actually receives
     /// rather than what is minted.
+    /// A quote that succeeds where the call reverts is worse than no quote: a
+    /// caller gating on `preview >= min` reads a number and signs a transaction
+    /// that cannot land. So this refuses everything it can prove `deposit` will
+    /// refuse, with the same error code.
+    ///
+    /// It cannot be an absolute guarantee, and the gap is worth stating rather
+    /// than implying. `deposit` checks the cap against `total_assets()` *after*
+    /// the strategy credits, and the credit is a measured delta this function
+    /// has no way to predict — so a deposit with room left under the cap may
+    /// still breach it, and a paused or shaving strategy can reject a deposit
+    /// no preview could have known about. What is certain is checked below;
+    /// what depends on the strategy's behaviour at call time is not.
     pub fn preview_deposit(env: Env, amount: i128) -> Result<i128, Error> {
+        // `deposit` rejects this first, before it ever reaches the share math.
+        // Quoting it as a successful 0 — or, for a negative amount, as a
+        // negative number of shares — is the same defect in a different place.
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // A market already at or over its cap rejects every positive deposit,
+        // and that is knowable here without predicting the credit. Quoting a
+        // number for a capped market was the exact "reads a quote where it
+        // should have read a failure" case this function exists to prevent.
+        let cap = Self::read_deposit_cap(&env);
+        if cap > 0 {
+            let config = Self::config_or_panic(&env);
+            if YieldStrategyClient::new(&env, &config.strategy).total_assets() >= cap {
+                return Err(Error::DepositCapExceeded);
+            }
+        }
+
         let rate = <Self as StandardizedYield>::exchange_rate(&env);
         let minted = Self::mul_div(&env, amount, WAD, rate);
         if Self::read_total_supply(&env) == 0 {
-            Ok((minted - MINIMUM_SHARES).max(0))
+            // Report the same refusal `deposit` will make rather than clamping
+            // to a successful zero.
+            if minted <= MINIMUM_SHARES {
+                return Err(Error::InitialDepositTooSmall);
+            }
+            Ok(minted - MINIMUM_SHARES)
         } else {
+            // Dust at a rate above WAD floors to zero shares, which `deposit`
+            // rejects as InvalidAmount. Mirror that rather than quoting a free
+            // no-op.
+            if minted <= 0 {
+                return Err(Error::InvalidAmount);
+            }
             Ok(minted)
         }
     }
@@ -296,6 +344,12 @@ impl SyVaultV2 {
     /// Underlying that `sy_amount` would redeem at the current rate, before any
     /// upstream liquidity constraint. Compare against `max_withdraw`.
     pub fn preview_redeem(env: Env, sy_amount: i128) -> Result<i128, Error> {
+        // Same rule as `preview_deposit`: refuse where `redeem` refuses, with
+        // the same error. Without this, `preview_redeem(-5)` returned `Ok(-5)` —
+        // a negative quantity of underlying for a call that reverts.
+        if sy_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         let rate = <Self as StandardizedYield>::exchange_rate(&env);
         Ok(Self::mul_div(&env, sy_amount, rate, WAD))
     }

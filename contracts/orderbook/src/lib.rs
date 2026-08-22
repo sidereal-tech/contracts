@@ -103,6 +103,7 @@ pub enum Error {
     MarketMatured = 17,
     MathOverflow = 18,
     PageTooLarge = 19,
+    InvalidFeeRecipient = 20,
 }
 
 #[contractevent]
@@ -167,6 +168,12 @@ impl Orderbook {
             return Err(Error::InvalidMaturity);
         }
         require_fee(taker_fee_bps)?;
+        if fee_recipient == env.current_contract_address()
+            || fee_recipient == pt_token
+            || fee_recipient == sy_token
+        {
+            return Err(Error::InvalidFeeRecipient);
+        }
 
         env.storage().instance().set(
             &DataKey::Config,
@@ -189,6 +196,10 @@ impl Orderbook {
         read_config(&env)
     }
 
+    pub fn maturity(env: Env) -> Result<u64, Error> {
+        Ok(read_config(&env)?.maturity)
+    }
+
     pub fn set_fee(env: Env, admin: Address, taker_fee_bps: i128) -> Result<(), Error> {
         let mut config = read_config(&env)?;
         admin.require_auth();
@@ -196,6 +207,13 @@ impl Orderbook {
             return Err(Error::NotAdmin);
         }
         require_fee(taker_fee_bps)?;
+        if taker_fee_bps > 0
+            && (config.fee_recipient == env.current_contract_address()
+                || config.fee_recipient == config.pt_token
+                || config.fee_recipient == config.sy_token)
+        {
+            return Err(Error::InvalidFeeRecipient);
+        }
         let old_fee_bps = config.taker_fee_bps;
         config.taker_fee_bps = taker_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
@@ -1003,8 +1021,37 @@ mod test {
     }
 
     #[test]
+    fn fee_recipient_is_valid_even_when_the_opening_fee_is_zero() {
+        for which in ["self", "pt", "sy"] {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|ledger| ledger.timestamp = NOW);
+            let admin = Address::generate(&env);
+            let pt = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let sy = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let id = env.register(Orderbook, ());
+            let client = OrderbookClient::new(&env, &id);
+            let recipient = match which {
+                "self" => id,
+                "pt" => pt.clone(),
+                _ => sy.clone(),
+            };
+            assert_eq!(
+                client.try_initialize(&admin, &pt, &sy, &MATURITY, &recipient, &0),
+                Err(Ok(Error::InvalidFeeRecipient)),
+                "a zero-fee orderbook must reject its {which} address"
+            );
+        }
+    }
+
+    #[test]
     fn maturity_stops_placement_and_fills_but_not_cancellation() {
         let f = fixture();
+        assert_eq!(f.client.maturity(), MATURITY);
         let id = f.client.place_order(
             &f.maker,
             &Side::Ask,

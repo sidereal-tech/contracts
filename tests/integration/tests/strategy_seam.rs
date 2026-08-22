@@ -792,6 +792,79 @@ fn a_first_deposit_too_small_to_fund_the_lock_is_rejected() {
     assert_eq!(market.vault.total_supply(), MINIMUM_SHARES + 1);
 }
 
+/// A preview that succeeds where the call reverts is worse than no preview: a
+/// caller gating on `preview >= min` reads a number, signs, and the transaction
+/// cannot land. Pin preview against deposit at every boundary, on both an empty
+/// and an open market — the empty branch was fixed first and the open branch
+/// carried the identical defect.
+#[test]
+fn preview_deposit_refuses_exactly_where_deposit_refuses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let market = blend_market(&env);
+
+    // Empty market: anything that cannot fund the lock must fail, not quote 0.
+    for amount in [1_i128, MINIMUM_SHARES - 1, MINIMUM_SHARES] {
+        assert_eq!(
+            market.vault.try_preview_deposit(&amount),
+            Err(Ok(VaultError::InitialDepositTooSmall)),
+            "preview_deposit({amount}) on an empty market must refuse like deposit"
+        );
+    }
+    // Non-positive amounts are rejected before the share math, with the same
+    // error deposit gives — not InitialDepositTooSmall, and never a negative
+    // quote.
+    for amount in [0_i128, -5] {
+        assert_eq!(
+            market.vault.try_preview_deposit(&amount),
+            Err(Ok(VaultError::InvalidAmount)),
+            "preview_deposit({amount}) must refuse as InvalidAmount"
+        );
+        assert_eq!(
+            market.vault.try_deposit(&market.user, &amount, &0),
+            Err(Ok(contract_error(VaultError::InvalidAmount))),
+            "and deposit({amount}) agrees"
+        );
+    }
+
+    // preview_redeem had the identical defect one function below, untouched by
+    // the first fix: `Ok(-5)` underlying for a call that reverts.
+    for amount in [0_i128, -5] {
+        assert_eq!(
+            market.vault.try_preview_redeem(&amount),
+            Err(Ok(VaultError::InvalidAmount)),
+            "preview_redeem({amount}) must refuse like redeem"
+        );
+    }
+
+    // Open the market, then check the branch that was left alone.
+    market.vault.deposit(&market.user, &(100 * UNIT), &0);
+    assert!(market.vault.preview_deposit(&(10 * UNIT)) > 0);
+    for amount in [0_i128, -5] {
+        assert_eq!(
+            market.vault.try_preview_deposit(&amount),
+            Err(Ok(VaultError::InvalidAmount)),
+            "preview_deposit({amount}) on an open market must refuse too"
+        );
+    }
+
+    // A market at its cap rejects every deposit, and the preview can prove it
+    // without predicting the strategy's credit. Quoting a number here was the
+    // remaining "succeeds where the call reverts" case.
+    let assets = market.vault.total_assets();
+    market.vault.set_deposit_cap(&market.admin, &assets);
+    assert_eq!(
+        market.vault.try_preview_deposit(&(10 * UNIT)),
+        Err(Ok(VaultError::DepositCapExceeded)),
+        "a capped market must not quote a deposit it will reject"
+    );
+    assert_eq!(
+        market.vault.try_deposit(&market.user, &(10 * UNIT), &0),
+        Err(Ok(contract_error(VaultError::DepositCapExceeded))),
+        "and deposit agrees"
+    );
+}
+
 /// The other half of C2: a market whose supply returns to zero with assets still
 /// in it used to re-bootstrap at `WAD` and hand the residual to the next
 /// one-stroop depositor. The supply can no longer reach zero, so there is no
@@ -898,6 +971,18 @@ fn withdraw_pays_from_idle_before_it_touches_the_pool() {
     let out = market.vault.redeem(&market.user, &(20 * UNIT), &(20 * UNIT));
     assert_eq!(out, 20 * UNIT, "and withdraw actually delivers it");
     assert_eq!(coin.balance(&market.user), start + 20 * UNIT);
+    assert_eq!(market.vault.total_assets(), 80 * UNIT);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        WAD,
+        "spending donated idle must not raise the rate"
+    );
+    market.pool.set_b_rate(&1_100_000_000_000);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        1_100_000_000_000_000_000,
+        "the excluded position units must keep their future interest out too"
+    );
     assert_eq!(
         coin.balance(&market.strategy.address),
         0,
@@ -926,6 +1011,12 @@ fn max_withdraw_is_exactly_what_a_mixed_idle_and_pool_withdrawal_delivers() {
     let quoted = market.vault.max_withdraw();
     let out = market.vault.redeem(&market.user, &(30 * UNIT), &0);
     assert_eq!(out, quoted, "the quote is the delivery");
+    assert_eq!(market.vault.total_assets(), 70 * UNIT);
+    assert_eq!(
+        market.vault.exchange_rate(),
+        WAD,
+        "mixed idle and pool liquidity must reduce backing with supply"
+    );
 }
 
 /// V1 recomputed the burn from what actually arrived; V2 had regressed to
