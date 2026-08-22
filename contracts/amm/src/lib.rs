@@ -499,13 +499,21 @@ impl Market for AmmMarket {
         // shares, and that cost is backed one-for-one by the dust pair it keeps
         // (see below).
         let shares_to_split = shares_in_for_face_up(env, yt_out, rate);
-        // The buyer funds exactly the part of the split the curve does not.
+        // The buyer funds the part of the split the curve does not, plus at
+        // most one share of rounding buffer. Computing the budget predicate
+        // from the difference of separately rounded legs made it non-monotone;
+        // the one-share upper envelope used by the solver is monotone and keeps
+        // exact-input search correct. Any buffer stays in reserves for LPs.
         // `sy_in` is a budget: charging all of it whenever the solver settles
         // for less would hand LPs the difference, so only `buyer_cost` moves.
         // The solver computed that same difference from the same helpers; fail
         // closed if they disagree, because a mismatch would tap LP reserves the
         // curve never accounted for.
-        if shares_to_split != checked_add(env, buyer_cost, sy_funded) || buyer_cost > sy_in {
+        let actual_cost = checked_sub(env, shares_to_split, sy_funded);
+        if buyer_cost < actual_cost
+            || buyer_cost > checked_add(env, actual_cost, 1)
+            || buyer_cost > sy_in
+        {
             panic_with_error!(env, Error::InsufficientLiquidity);
         }
 
@@ -1269,39 +1277,14 @@ fn try_exact_pt_out_sy_in(
 
 /// Where a candidate YT size sits relative to the buyer's budget.
 ///
-/// The three arms partition the candidate range into three contiguous blocks,
-/// which is what makes the binary search below correct. Post-conversion the
-/// buyer's cost
-///
-/// ```text
-/// cost(face) = ceil(face * WAD / rate) - curve_proceeds(face)
-/// ```
-///
-/// is strictly increasing in `face` *as a continuous function*: the split cost
-/// is linear, and the curve's proceeds per unit of face fall as more PT is
-/// pushed into the pool. So the affordable set is an interval whose lower edge
-/// is set by integer rounding (a face so small the curve's proceeds floor to
-/// zero, or so small the fee-free proceeds still cover the split) and whose
-/// upper edge is the budget or the pool's liquidity. `TooSmall` means "search
-/// up" and `TooLarge` means "search down" — the assumption the previous
-/// prefix-only search made unconditionally, and which was false at rates above
-/// 1.0 because the whole feasible set could sit above the first probe.
-///
-/// **Caveat, measured:** the discrete `cost` is not *monotone*. The ceil/floor
-/// pair jitters it by about a stroop, so on a cost plateau the comparison
-/// against `sy_in` can alternate — e.g. pool 1000/1000, R = 1.05, anchor 1.05,
-/// 90-day, zero fee: `cost(20) = 2` but `cost(21) = 1`. With a budget sitting
-/// inside that jitter the partition reads `A A L L A A A L L L`, not
-/// `S* A* L*`, and the search can return a non-maximal size or miss a feasible
-/// one entirely (worst observed gap 1434 stroops, widening near maturity where
-/// plateaus are longer).
-///
-/// This is bounded and one-directional: `best` is only ever set from a probe
-/// that came back `Affordable`, and the buyer is charged exactly that probe's
-/// cost, so **the pool is never short-changed** — the buyer just occasionally
-/// gets less YT than the true maximum. `quote_sy_for_yt` runs this same solver,
-/// so a quote can never disagree with execution. Closing it properly means
-/// clamping the low edge before the search rather than trusting monotonicity.
+/// The budget cost is a monotone one-share upper envelope of the route's exact
+/// balance delta. The physical delta subtracts two separately rounded share
+/// quantities and can dip by one share as `face` rises, which made a binary
+/// search miss valid fills. Instead the probe first takes the asset-unit spread
+/// (`face - asset_out`), converts that once with ceil rounding, and adds one
+/// share. The exact delta is always either that value or one less. This costs a
+/// buyer at most one stroop per YT buy, never underfunds the split, and restores
+/// the contiguous `TooSmall* Affordable* TooLarge*` partition the search needs.
 enum YtBuyProbe {
     /// Below the affordable interval: the split's face is too small for the
     /// curve leg to return anything the pool can safely account for.
@@ -1369,14 +1352,16 @@ fn probe_yt_buy(
     ) {
         return YtBuyProbe::TooLarge;
     }
-    let shares_needed = shares_in_for_face_up(env, face, comp.sy_rate);
-    if shares_needed <= sy_paid {
-        // The curve would fund the whole split on its own, i.e. free YT at LP
-        // expense. Never bank it; a larger face carries a strictly higher cost,
-        // so keep searching up.
-        return YtBuyProbe::TooSmall;
-    }
-    let cost = shares_needed - sy_paid;
+    // `asset_out` rises no faster than `face`: the exchange rate is at least
+    // one and rises as more PT is sold. Therefore this asset spread is
+    // non-decreasing, as is its single rounded share conversion. Adding one is
+    // the tight upper bound on the route's separately rounded physical delta.
+    let asset_spread = checked_sub(env, face, asset_out);
+    let cost = checked_add(
+        env,
+        shares_in_for_face_up(env, asset_spread, comp.sy_rate),
+        1,
+    );
     if cost > sy_in {
         YtBuyProbe::TooLarge
     } else {
@@ -1388,10 +1373,10 @@ fn probe_yt_buy(
 /// the SY shares that actually buys.
 ///
 /// The pool splits ceil(yt_out * WAD / rate) shares to mint `yt_out` face of PT
-/// + YT and sells the PT to itself; the buyer covers the difference. `best` is
-/// only ever set on a candidate whose cost fits inside `sy_in`, and the
-/// three-way probe keeps the search from discarding the feasible interval when
-/// the first candidate lands below it.
+/// + YT and sells the PT to itself; the buyer covers the monotone, one-share
+/// upper bound returned by `probe_yt_buy`. `best` is therefore the largest size
+/// admitted by the budget and the curve, rather than whichever affordable
+/// island a non-monotone rounding comparison happened to visit.
 fn solve_yt_out_for_sy_in(
     env: &Env,
     config: &Config,
@@ -3151,10 +3136,10 @@ mod test {
             let yt_out = fixture.client.quote_sy_for_yt(&sy_in);
             let cost = fixture.client.quote_sy_for_yt_cost(&sy_in);
             let plain_leg = fixture.client.quote_pt_for_sy(&yt_out);
-            assert_eq!(
-                cost,
-                shares_to_mint_face(yt_out, rate) - plain_leg,
-                "rate {rate}: YT buy route disagrees with the plain PT sell leg"
+            let physical_cost = shares_to_mint_face(yt_out, rate) - plain_leg;
+            assert!(
+                cost == physical_cost || cost == physical_cost + 1,
+                "rate {rate}: YT buy route charged {cost}, physical legs cost {physical_cost}"
             );
             assert!(cost <= sy_in);
             assert!(
@@ -3228,6 +3213,57 @@ mod test {
                     !one_more,
                     "rate {rate}, {sy_in} SY: {} YT also fits, so {yt_out} is not maximal",
                     yt_out + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yt_buy_solver_matches_an_exhaustive_oracle_across_rounding_plateaus() {
+        let fixture = seeded_market_at_rate(
+            NOW,
+            1_050_000_000_000_000_000,
+            2_500,
+            2_500,
+        );
+        fixture.env.as_contract(&fixture.contract_id, || {
+            let mut config = read_config(&fixture.env).unwrap();
+            config.fee_bps = 0;
+            fixture
+                .env
+                .storage()
+                .instance()
+                .set(&DataKey::Config, &config);
+        });
+        let config = fixture.client.config();
+        let state = fixture.client.state();
+        let comp = precompute_or_panic(&fixture.env, &config, &state);
+
+        for budget in 1_i128..=20 {
+            let max_shares = budget + state.total_sy;
+            let high = min(
+                mul_div_down_or_panic(&fixture.env, max_shares, comp.sy_rate, WAD),
+                MAX_RESERVE_UNITS,
+            );
+            let mut expected = None;
+            for face in 1..=high {
+                if let YtBuyProbe::Affordable(cost) =
+                    probe_yt_buy(&fixture.env, &config, &state, &comp, face, budget)
+                {
+                    expected = Some((face, cost));
+                }
+            }
+            if let Some(expected) = expected {
+                assert_eq!(
+                    solve_yt_out_for_sy_in(
+                        &fixture.env,
+                        &config,
+                        &state,
+                        &comp,
+                        budget,
+                    ),
+                    expected,
+                    "budget {budget}: binary search must match the exhaustive maximum"
                 );
             }
         }
