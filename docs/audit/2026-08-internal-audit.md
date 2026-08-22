@@ -86,13 +86,11 @@ found while fixing it were not mainnet-specific: a failed contract read scored a
 a satisfied invariant (`BigInt("")` is `0n`), and PT coverage was checked against
 the live rate rather than the settlement rate. Both applied to V2 markets too.
 
-**M5 needs a number from you, and only before the first V2 `initialize`.** The
-plumbing is in and tested: `yield_fee_bps` and `fee_recipient` are `Config`
-fields fixed at initialization, with no setter, a 20% ceiling enforced in the
-wasm, and a skim taken from the PT-senior-capped surplus. Deploy scripts default
-to **0 bps**, so nothing charges anything until someone decides it should. Peer
-protocols sit around 3–5% of claimed yield. After a market's `initialize`
-confirms, its fee is fixed for that market's entire life.
+**Post-audit update:** the fee decision is no longer limited to initialization.
+`yield_fee_bps` launches from the deployment value and can subsequently be
+changed only with the configured tokenizer admin's authorization. The 20%
+on-chain ceiling and PT-senior skim point remain unchanged, and every successful
+change emits `YieldFeeSet`. `fee_recipient` remains fixed at initialization.
 
 ---
 

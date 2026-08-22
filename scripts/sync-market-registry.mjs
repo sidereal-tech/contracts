@@ -133,6 +133,7 @@ function toMarket(manifest, sourcePath) {
       yt: contracts.yt,
       tokenizer: contracts.tokenizer,
       market: contracts.amm,
+      orderbook: contracts.orderbook ?? "",
     },
   };
 }
@@ -223,6 +224,7 @@ if (envIndex !== -1) {
     YT: market.contracts.yt,
     TK: market.contracts.tokenizer,
     AMM: market.contracts.market,
+    ORDERBOOK: market.contracts.orderbook ?? "",
     UPSTREAM_POOL: market.strategy.pool,
     UPSTREAM_RESERVE: market.strategy.reserve,
   };

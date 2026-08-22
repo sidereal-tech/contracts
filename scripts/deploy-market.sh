@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Deploys one complete Sidereal V2 market: strategy + SY vault + PT + YT +
-# tokenizer + AMM.
+# tokenizer + AMM + resting orderbook.
 #
 # This is the multi-market successor to deploy-testnet-resilient.sh. The
 # difference that matters: state and manifest paths are keyed by MARKET_ID, not
@@ -51,10 +51,10 @@ MATURITY="${MATURITY:-$(( $(date -u +%s) + 90 * 86400 ))}"
 RISK_TIER="${RISK_TIER:-pilot}"
 DEPOSIT_CAP="${DEPOSIT_CAP:-0}"
 
-# Protocol fee on *claimed yield*, fixed at the tokenizer's initialization and
-# immutable for the life of the market -- there is no fee setter, so this is the
-# only moment it can be chosen. It is taken from the PT-senior-capped junior
-# surplus, so it can never touch PT principal or move the exchange rate.
+# Initial protocol fee on *claimed yield*. The tokenizer admin can update it
+# later with set_fee; every update remains subject to the on-chain 20% ceiling.
+# It is taken from the PT-senior-capped junior surplus, so it can never touch PT
+# principal or move the exchange rate.
 #
 # Defaults to 0: a market deploys fee-free unless someone decides otherwise, and
 # the decision is explicit rather than inherited from a script default. The
@@ -69,6 +69,9 @@ DEPOSIT_CAP="${DEPOSIT_CAP:-0}"
 YIELD_FEE_BPS_ENV="${YIELD_FEE_BPS-}"
 FEE_RECIPIENT_ENV="${FEE_RECIPIENT-}"
 YIELD_FEE_BPS="${YIELD_FEE_BPS:-0}"
+# Taker fee on resting-order fills. The orderbook admin may update it later,
+# subject to the contract's 10% ceiling. Defaults to fee-free.
+ORDERBOOK_FEE_BPS="${ORDERBOOK_FEE_BPS:-0}"
 # FEE_RECIPIENT defaults to the deployer, resolved after the identity is read.
 RISK_NOTES="${RISK_NOTES:-Unaudited pilot market. Deposit only what you can afford to lose.}"
 
@@ -104,6 +107,9 @@ save_state() {
     printf 'SCALAR_ROOT=%s\n' "$(quote_env "$SCALAR_ROOT")"
     printf 'INITIAL_ANCHOR=%s\n' "$(quote_env "$INITIAL_ANCHOR")"
     printf 'FEE_BPS=%s\n' "$(quote_env "$FEE_BPS")"
+    printf 'YIELD_FEE_BPS=%s\n' "$(quote_env "$YIELD_FEE_BPS")"
+    printf 'ORDERBOOK_FEE_BPS=%s\n' "$(quote_env "$ORDERBOOK_FEE_BPS")"
+    printf 'FEE_RECIPIENT=%s\n' "$(quote_env "${FEE_RECIPIENT:-}")"
     printf 'TWAP_WINDOW=%s\n' "$(quote_env "$TWAP_WINDOW")"
     # Persisted like every other economic parameter. Without this a resumed
     # deploy skips INIT_TK (already done) but re-derives these from a plain
@@ -123,6 +129,7 @@ save_state() {
     printf 'YT=%s\n' "$(quote_env "${YT:-}")"
     printf 'TK=%s\n' "$(quote_env "${TK:-}")"
     printf 'AMM=%s\n' "$(quote_env "${AMM:-}")"
+    printf 'ORDERBOOK=%s\n' "$(quote_env "${ORDERBOOK:-}")"
     printf 'INIT_STRATEGY=%s\n' "$(quote_env "${INIT_STRATEGY:-0}")"
     printf 'INIT_SY=%s\n' "$(quote_env "${INIT_SY:-0}")"
     printf 'SET_CAP=%s\n' "$(quote_env "${SET_CAP:-0}")"
@@ -130,6 +137,7 @@ save_state() {
     printf 'INIT_YT=%s\n' "$(quote_env "${INIT_YT:-0}")"
     printf 'INIT_TK=%s\n' "$(quote_env "${INIT_TK:-0}")"
     printf 'INIT_AMM=%s\n' "$(quote_env "${INIT_AMM:-0}")"
+    printf 'INIT_ORDERBOOK=%s\n' "$(quote_env "${INIT_ORDERBOOK:-0}")"
   } > "$tmp"
   mv "$tmp" "$STATE_FILE"
 }
@@ -281,6 +289,7 @@ PT_WASM_HASH="$(wasm_hash "$WASM_DIR/sidereal_pt_token.wasm")"
 YT_WASM_HASH="$(wasm_hash "$WASM_DIR/sidereal_yt_token.wasm")"
 TK_WASM_HASH="$(wasm_hash "$WASM_DIR/sidereal_tokenizer.wasm")"
 AMM_WASM_HASH="$(wasm_hash "$WASM_DIR/sidereal_amm.wasm")"
+ORDERBOOK_WASM_HASH="$(wasm_hash "$WASM_DIR/sidereal_orderbook.wasm")"
 
 if ! stellar keys address "$IDENTITY" >/dev/null 2>&1; then
   log "Generating and funding deployer identity '$IDENTITY' on $NETWORK"
@@ -302,6 +311,7 @@ deploy_wasm_once PT sidereal_pt_token
 deploy_wasm_once YT sidereal_yt_token
 deploy_wasm_once TK sidereal_tokenizer
 deploy_wasm_once AMM sidereal_amm
+deploy_wasm_once ORDERBOOK sidereal_orderbook
 
 log "Initializing strategy ($STRATEGY_KIND)"
 invoke_once INIT_STRATEGY "$STRATEGY" initialize \
@@ -362,13 +372,26 @@ invoke_once INIT_AMM "$AMM" initialize \
   --fee_bps "$FEE_BPS" \
   --twap_window "$TWAP_WINDOW"
 
+log "Initializing resting orderbook"
+invoke_once INIT_ORDERBOOK "$ORDERBOOK" initialize \
+  --admin "$DEPLOYER_ADDRESS" \
+  --pt_token "$PT" \
+  --sy_token "$SY" \
+  --maturity "$MATURITY" \
+  --fee_recipient "$FEE_RECIPIENT" \
+  --taker_fee_bps "$ORDERBOOK_FEE_BPS"
 # PT, YT, the tokenizer and the AMM each store their own copy of `maturity`,
 # and nothing on-chain cross-checks them. A mismatch is silent at deploy and
 # then bricks every YT transfer and burn inside the gap window, because YT picks
 # observe-vs-freeze off its own copy while the tokenizer validates against its.
 # They all receive one $MATURITY above, so this only fires if a future edit
 # splits them -- which is exactly when nobody would be looking.
-log "Verifying all four contracts agree on maturity"
+#
+# GAP, recorded rather than left implicit: the orderbook is a fifth contract
+# with its own `maturity` copy (initialized above) and is NOT covered here. It
+# exposes no `maturity()` getter -- only `config()` -- so it cannot join this
+# loop without a contract change. Adding that getter would close the gap.
+log "Verifying PT, YT, tokenizer and AMM agree on maturity"
 for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM"; do
   name="${pair%%:*}"; id="${pair#*:}"
   # Check the invoke's STATUS, not just its text. An earlier version used
@@ -387,7 +410,7 @@ for pair in "PT:$PT" "YT:$YT" "tokenizer:$TK" "AMM:$AMM"; do
     die "$name reports maturity $got, expected $MATURITY -- refusing to record a market whose contracts disagree"
   fi
 done
-log "  all four agree on $MATURITY"
+log "  all four agree on $MATURITY (orderbook not cross-checked; see above)"
 
 log "Verifying deployed bytecode matches the local build"
 STRATEGY_CHAIN_HASH="$(onchain_hash "$STRATEGY")"
@@ -396,6 +419,7 @@ PT_CHAIN_HASH="$(onchain_hash "$PT")"
 YT_CHAIN_HASH="$(onchain_hash "$YT")"
 TK_CHAIN_HASH="$(onchain_hash "$TK")"
 AMM_CHAIN_HASH="$(onchain_hash "$AMM")"
+ORDERBOOK_CHAIN_HASH="$(onchain_hash "$ORDERBOOK")"
 
 [[ "$STRATEGY_WASM_HASH" == "$STRATEGY_CHAIN_HASH" ]] || die "strategy Wasm hash mismatch"
 [[ "$SY_WASM_HASH" == "$SY_CHAIN_HASH" ]] || die "SY vault Wasm hash mismatch"
@@ -403,6 +427,7 @@ AMM_CHAIN_HASH="$(onchain_hash "$AMM")"
 [[ "$YT_WASM_HASH" == "$YT_CHAIN_HASH" ]] || die "YT Wasm hash mismatch"
 [[ "$TK_WASM_HASH" == "$TK_CHAIN_HASH" ]] || die "tokenizer Wasm hash mismatch"
 [[ "$AMM_WASM_HASH" == "$AMM_CHAIN_HASH" ]] || die "AMM Wasm hash mismatch"
+[[ "$ORDERBOOK_WASM_HASH" == "$ORDERBOOK_CHAIN_HASH" ]] || die "orderbook Wasm hash mismatch"
 
 # The seam's own wiring assertion. record-deploy-provenance.sh refuses to write a
 # manifest for a wrapper with idle custody; the V2 equivalent is proving the
@@ -451,15 +476,19 @@ initial_anchor = "$INITIAL_ANCHOR"
 fee_bps = $FEE_BPS
 twap_window = $TWAP_WINDOW
 
-# The protocol's cut of claimed yield, and where it is paid. Both are fixed at
-# the tokenizer's initialization and can never be changed for this market, which
-# makes them the two most consequential numbers in this file -- and until now
-# they were the only economic parameters the manifest did not record. A
-# mis-entered value would otherwise leave no artifact anywhere except
-# \`tokenizer.config()\` on chain.
+# The protocol's cut of claimed yield, and where it is paid. \`recipient\` is
+# fixed at the tokenizer's initialization and can never be changed for this
+# market. \`yield_fee_bps\` is the value set at deploy; it is admin-mutable via
+# \`tokenizer.set_fee\`, so treat this as the market's opening fee rather than a
+# permanent one, and read \`tokenizer.config()\` on chain for the current value.
+# Recorded here because a mis-entered value would otherwise leave no artifact
+# anywhere else.
 [fee]
 yield_fee_bps = $YIELD_FEE_BPS
 recipient = "$FEE_RECIPIENT"
+[orderbook]
+taker_fee_bps = $ORDERBOOK_FEE_BPS
+fee_recipient = "$FEE_RECIPIENT"
 
 [contracts]
 underlying = "$UNDERLYING_ID"
@@ -469,6 +498,7 @@ pt = "$PT"
 yt = "$YT"
 tokenizer = "$TK"
 amm = "$AMM"
+orderbook = "$ORDERBOOK"
 
 [wasm_hashes]
 strategy = "$STRATEGY_WASM_HASH"
@@ -477,6 +507,7 @@ pt = "$PT_WASM_HASH"
 yt = "$YT_WASM_HASH"
 tokenizer = "$TK_WASM_HASH"
 amm = "$AMM_WASM_HASH"
+orderbook = "$ORDERBOOK_WASM_HASH"
 
 [onchain_hashes]
 strategy = "$STRATEGY_CHAIN_HASH"
@@ -485,6 +516,7 @@ pt = "$PT_CHAIN_HASH"
 yt = "$YT_CHAIN_HASH"
 tokenizer = "$TK_CHAIN_HASH"
 amm = "$AMM_CHAIN_HASH"
+orderbook = "$ORDERBOOK_CHAIN_HASH"
 
 [operations]
 keeper_configured = ${KEEPER_CONFIGURED:-0}
