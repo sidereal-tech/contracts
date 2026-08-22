@@ -49,9 +49,9 @@ fn deploy() -> Market {
     deploy_with_fee(0)
 }
 
-/// `yield_fee_bps` is the protocol's cut of claimed yield, fixed at
-/// initialization. Every test above runs fee-free so its arithmetic reads as the
-/// protocol's own; the fee tests opt in.
+/// `yield_fee_bps` is the initial protocol cut of claimed yield. Every test
+/// above runs fee-free so its arithmetic reads as the protocol's own; the fee
+/// tests opt in either at initialization or through the admin setter.
 fn deploy_with_fee(yield_fee_bps: i128) -> Market {
     let env = Env::default();
     env.mock_all_auths();
@@ -1373,11 +1373,29 @@ fn conservation_holds_across_random_sequences() {
 //
 // The fee is taken from `pay` -- the value AFTER the PT-senior cap -- so it is
 // structurally incapable of reaching PT principal. These tests pin that, plus
-// the two properties that make the fee safe to add to an immutable market at
-// all: it does not move the exchange rate, and it cannot be introduced later.
+// the properties that keep the fee safe when an admin updates it: it does not
+// move the exchange rate and it remains subordinate to PT principal.
 
 /// 5% of claimed yield, comparable to what peer protocols charge.
 const FEE_500_BPS: i128 = 500;
+
+#[test]
+fn an_admin_fee_update_applies_to_subsequent_yield_claims() {
+    let m = deploy_with_fee(0);
+    let alice = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+    m.set_rate(RATE_1_10);
+
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+    let owed = yt.preview_claim_yield(&alice);
+    TokenizerClient::new(&m.env, &m.tokenizer).set_fee(&m.admin, &FEE_500_BPS);
+
+    let claimed = m.claim(&alice);
+    let fee_paid = m.sy_balance(&m.fee_recipient);
+    assert_eq!(fee_paid, owed * FEE_500_BPS / 10_000);
+    assert_eq!(claimed, owed - fee_paid);
+}
 
 #[test]
 fn the_protocol_fee_is_skimmed_from_the_holders_yield_not_from_principal() {

@@ -4,8 +4,8 @@
 
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, I256, IntoVal,
-    MuxedAddress, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address, Env,
+    IntoVal, MuxedAddress, Symbol, Val, Vec, I256,
 };
 
 const WAD: i128 = 1_000_000_000_000_000_000;
@@ -19,13 +19,11 @@ const TTL_EXTEND_TO_LEDGERS: u32 = 120 * LEDGERS_PER_DAY;
 /// Basis-point denominator for `yield_fee_bps`.
 const BPS_DENOMINATOR: i128 = 10_000;
 
-/// Hard ceiling on the protocol's cut of claimed yield, enforced at
-/// initialization. The fee is immutable once set, so this bound is the only
-/// protection a depositor has against a mis-set market — and because it is
-/// checked in the wasm rather than in a deploy script, it holds for every
-/// market anyone ever deploys from this code. 20% is well above the 3-5% that
-/// comparable protocols charge, and far below a level that would make YT
-/// pointless.
+/// Hard ceiling on the protocol's cut of claimed yield, enforced both at
+/// initialization and on every admin update. Because it is checked in the wasm
+/// rather than in a deploy script, it holds for every market anyone deploys
+/// from this code. 20% is well above the 3-5% that comparable protocols charge,
+/// and far below a level that would make YT pointless.
 const MAX_YIELD_FEE_BPS: i128 = 2_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,9 +36,8 @@ pub struct Config {
     pub maturity: u64,
     /// Where the protocol's cut of claimed yield is paid, in SY shares.
     pub fee_recipient: Address,
-    /// The protocol's cut of *claimed yield*, in basis points. Fixed at
-    /// initialization and never settable again: there is no fee setter, so a
-    /// market's economics cannot change under the people already in it.
+    /// The protocol's cut of *claimed yield*, in basis points. The configured
+    /// admin may update it, subject to [`MAX_YIELD_FEE_BPS`].
     ///
     /// The fee is taken from the PT-senior-capped junior surplus (see
     /// `claim_yield`), never from principal and never from the escrow reserved
@@ -92,6 +89,16 @@ pub enum Error {
     Insolvent = 9,
     /// `yield_fee_bps` was negative or above [`MAX_YIELD_FEE_BPS`].
     InvalidFee = 10,
+    /// Caller is not the admin recorded at initialization.
+    NotAdmin = 11,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldFeeSet {
+    pub admin: Address,
+    pub old_fee_bps: i128,
+    pub new_fee_bps: i128,
 }
 
 #[contract]
@@ -99,11 +106,9 @@ pub struct Tokenizer;
 
 #[contractimpl]
 impl Tokenizer {
-    /// `yield_fee_bps` is the protocol's cut of claimed yield and is immutable
-    /// after this call — there is deliberately no setter, so the fee cannot be
-    /// introduced or raised under holders who already have a position. Pass 0
-    /// for a fee-free market; the plumbing still exists in the wasm, which is
-    /// the point, because it cannot be added later.
+    /// `yield_fee_bps` is the initial protocol cut of claimed yield. Pass 0 for
+    /// a fee-free launch. The configured admin may update it later with
+    /// [`Tokenizer::set_fee`], always subject to [`MAX_YIELD_FEE_BPS`].
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -144,6 +149,31 @@ impl Tokenizer {
 
     pub fn config(env: Env) -> Result<Config, Error> {
         Self::read_config(&env)
+    }
+
+    /// Updates the protocol cut of claimed yield. Admin only.
+    pub fn set_fee(env: Env, admin: Address, yield_fee_bps: i128) -> Result<(), Error> {
+        let mut config = Self::read_config(&env)?;
+        admin.require_auth();
+        if admin != config.admin {
+            return Err(Error::NotAdmin);
+        }
+        if !(0..=MAX_YIELD_FEE_BPS).contains(&yield_fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+
+        let old_fee_bps = config.yield_fee_bps;
+        config.yield_fee_bps = yield_fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        Self::bump_instance_ttl(&env);
+
+        YieldFeeSet {
+            admin,
+            old_fee_bps,
+            new_fee_bps: yield_fee_bps,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     pub fn maturity(env: Env) -> Result<u64, Error> {
@@ -827,25 +857,42 @@ mod test {
     }
 
     #[test]
-    fn there_is_no_fee_setter() {
-        // The fee is chosen once, at initialization, and the market's economics
-        // cannot change under holders who already have a position. If a setter
-        // is ever added, this test is the place that should have to argue for it.
+    fn admin_can_update_yield_fee() {
         let fixture = fixture(NOW);
         initialize_with_fee(&fixture, 500);
-        assert_eq!(fixture.client.config().yield_fee_bps, 500);
-        // Re-initialization is the only route to a different fee, and it is closed.
-        let repeat = fixture.client.try_initialize(
-            &fixture.admin,
-            &fixture.sy_token,
-            &fixture.pt_token,
-            &fixture.yt_token,
-            &MATURITY,
-            &fixture.fee_recipient,
-            &0_i128,
-        );
-        assert!(repeat.is_err(), "a second initialize must not reprice a live market");
-        assert_eq!(fixture.client.config().yield_fee_bps, 500);
+        fixture.client.set_fee(&fixture.admin, &750);
+        let auths = fixture.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, fixture.admin);
+        assert_eq!(fixture.client.config().yield_fee_bps, 750);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn non_admin_cannot_update_yield_fee() {
+        let fixture = fixture(NOW);
+        initialize_with_fee(&fixture, 500);
+        fixture
+            .client
+            .set_fee(&Address::generate(&fixture.env), &750);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn yield_fee_update_rejects_a_fee_above_the_ceiling() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture
+            .client
+            .set_fee(&fixture.admin, &(MAX_YIELD_FEE_BPS + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn yield_fee_update_rejects_a_negative_fee() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.admin, &-1);
     }
 
     #[test]

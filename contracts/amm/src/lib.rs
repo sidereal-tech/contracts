@@ -7,8 +7,8 @@ use core::cmp::min;
 use sidereal_shared_types::Market;
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, vec, Address,
-    Env, IntoVal, MuxedAddress, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    vec, Address, Env, IntoVal, MuxedAddress, Symbol, Val, Vec,
 };
 
 const WAD: i128 = 1_000_000_000_000_000_000;
@@ -88,6 +88,16 @@ pub enum Error {
     TradeNotFound = 17,
     InputOutOfBounds = 18,
     InvalidSyRate = 19,
+    /// Caller is not the admin recorded at initialization.
+    NotAdmin = 20,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSet {
+    pub admin: Address,
+    pub old_fee_bps: i128,
+    pub new_fee_bps: i128,
 }
 
 /// Everything the curve needs for one invocation, resolved once.
@@ -217,6 +227,31 @@ impl AmmMarket {
 
     pub fn config(env: Env) -> Result<Config, Error> {
         read_config(&env)
+    }
+
+    /// Updates the fee applied to subsequent swaps. Admin only.
+    pub fn set_fee(env: Env, admin: Address, fee_bps: i128) -> Result<(), Error> {
+        let mut config = read_config(&env)?;
+        admin.require_auth();
+        if admin != config.admin {
+            return Err(Error::NotAdmin);
+        }
+        if !(0..BPS_DENOMINATOR).contains(&fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+
+        let old_fee_bps = config.fee_bps;
+        config.fee_bps = fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance_ttl(&env);
+
+        FeeSet {
+            admin,
+            old_fee_bps,
+            new_fee_bps: fee_bps,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     pub fn state(env: Env) -> Result<State, Error> {
@@ -2064,6 +2099,41 @@ mod test {
         assert_eq!(fixture.client.reserve_pt(), 0);
         assert_eq!(fixture.client.reserve_sy(), 0);
         assert_eq!(fixture.client.total_lp(), 0);
+    }
+
+    #[test]
+    fn admin_can_update_swap_fee() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.admin, &25);
+        let auths = fixture.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, fixture.admin);
+        assert_eq!(fixture.client.config().fee_bps, 25);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn non_admin_cannot_update_swap_fee() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.bob, &25);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7)")]
+    fn swap_fee_update_rejects_the_denominator() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.admin, &BPS_DENOMINATOR);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7)")]
+    fn swap_fee_update_rejects_a_negative_fee() {
+        let fixture = fixture(NOW);
+        initialize(&fixture);
+        fixture.client.set_fee(&fixture.admin, &-1);
     }
 
     #[test]

@@ -51,10 +51,10 @@ MATURITY="${MATURITY:-$(( $(date -u +%s) + 90 * 86400 ))}"
 RISK_TIER="${RISK_TIER:-pilot}"
 DEPOSIT_CAP="${DEPOSIT_CAP:-0}"
 
-# Protocol fee on *claimed yield*, fixed at the tokenizer's initialization and
-# immutable for the life of the market -- there is no fee setter, so this is the
-# only moment it can be chosen. It is taken from the PT-senior-capped junior
-# surplus, so it can never touch PT principal or move the exchange rate.
+# Initial protocol fee on *claimed yield*. The tokenizer admin can update it
+# later with set_fee; every update remains subject to the on-chain 20% ceiling.
+# It is taken from the PT-senior-capped junior surplus, so it can never touch PT
+# principal or move the exchange rate.
 #
 # Defaults to 0: a market deploys fee-free unless someone decides otherwise, and
 # the decision is explicit rather than inherited from a script default. The
