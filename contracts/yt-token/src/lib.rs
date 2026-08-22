@@ -138,10 +138,32 @@ impl YtToken {
         Ok(Self::read_basis(&env, &holder))
     }
 
-    /// Aggregate yield basis across every holder. Together with
-    /// `total_accrued_yield` this is the protocol-wide YT claim on escrow:
-    /// `escrow_shares >= total_yield_basis() + total_accrued_yield()` holds at
-    /// every state transition of a solvent market, independent of the rate.
+    /// Aggregate yield basis across every holder, maintained by delta so it
+    /// cannot drift from the sum of `yield_basis`.
+    ///
+    /// **This is an upper bound on the YT claim, not an equality, and it is
+    /// only tight before escrow starts leaving the market.** Basis is the whole
+    /// escrow slice backing a YT position — principal plus yield — because the
+    /// claim is the *difference* `basis - ceil(balance * WAD / R)`. Two
+    /// tokenizer paths remove escrow without ever calling into this contract,
+    /// so nothing here writes the basis down when they do:
+    ///
+    /// - `redeem_at_maturity` burns PT and pushes escrow out. PT burn does not
+    ///   touch the YT ledger, and there is no write-down path (`write_basis` is
+    ///   reachable only from mint/settle/move/burn of *YT*). After a full
+    ///   redemption this aggregate can overstate the real obligation by most of
+    ///   the position, on the ordinary happy path.
+    /// - `recombine` by an *underwater* holder (one whose blended acquisition
+    ///   rate is above the current rate) pays out `min(full, pro_rata)` while
+    ///   retiring only their basis slice, which is smaller. The PT haircut
+    ///   itself is fair, but escrow falls further than the ledger does.
+    ///
+    /// So `escrow_shares >= total_yield_basis() + total_accrued_yield()` holds
+    /// only while no PT has been redeemed and no underwater recombine has
+    /// happened. **A post-maturity sweep or a pro-rata junior split must not be
+    /// sized off this number** — redemption is exactly the regime a sweep runs
+    /// in, and there it reserves far too much. Closing that needs a write-down
+    /// hook the tokenizer can call on PT burn, which does not exist yet.
     pub fn total_yield_basis(env: Env) -> Result<i128, Error> {
         Self::read_config(&env)?;
         Ok(Self::read_total_basis(&env))
@@ -168,10 +190,21 @@ impl YtToken {
         Ok(Self::read_accrued(&env, &holder))
     }
 
-    /// Aggregate banked (settled, unclaimed) yield across every holder. The
-    /// aggregate ledger the pro-rata junior split and the post-maturity escrow
-    /// sweep need: it is the exact total SY the escrow still owes YT for yield
-    /// already recognized, readable in one call without enumerating holders.
+    /// Aggregate banked (settled, unclaimed) yield across every holder,
+    /// maintained by delta so it cannot drift from the sum of `accrued_yield`.
+    /// Readable in one call without enumerating holders, which is the primitive
+    /// a pro-rata junior split and a post-maturity escrow sweep both need.
+    ///
+    /// **It is what escrow *owes*, which is not the same as what escrow can
+    /// pay.** `consume` is the only path that lowers it and it fires only on
+    /// actual payment, so yield that is banked but permanently unpayable —
+    /// because escrow drained below the PT reservation — accumulates here
+    /// monotonically with no write-down. A shortfall can therefore leave this
+    /// reading a large obligation against an escrow of almost nothing.
+    ///
+    /// Consumers must treat it as a claim, not a balance: pay out `min(this,
+    /// what escrow actually holds above the PT reservation)`, never this alone.
+    /// See `total_yield_basis` for the parallel caveat on the other aggregate.
     pub fn total_accrued_yield(env: Env) -> Result<i128, Error> {
         Self::read_config(&env)?;
         Ok(Self::read_total_accrued(&env))
@@ -750,10 +783,22 @@ impl YtToken {
     }
 
     /// Burns `amount` YT from `from` and retires the basis that backed it. The
-    /// slice rounds UP so the surviving balance is never left over-based, which
-    /// keeps `escrow >= total_yield_basis + total_accrued_yield` through the
-    /// tokenizer's recombine (which pays out at most the principal the retired
-    /// basis was reserving).
+    /// slice rounds UP so the surviving balance is never left over-based.
+    ///
+    /// That rounding is enough while the holder is at or above the rate their
+    /// position was acquired at, where the retired basis covers what recombine
+    /// pays out. It is **not** enough for an underwater holder: `recombine` pays
+    /// `min(full, pro_rata)`, and the `pro_rata` cap is measured against escrow
+    /// and PT supply, not against this holder's basis slice, so the payout can
+    /// exceed what is retired here. Measured on a two-holder market whose rate
+    /// collapsed below one holder's acquisition rate, escrow fell 25% further
+    /// than the ledger did.
+    ///
+    /// So this does not preserve `escrow >= total_yield_basis +
+    /// total_accrued_yield` in general — see the caveats on
+    /// [`Self::total_yield_basis`], which document the two paths that break it.
+    /// The haircut itself is fair; the aggregate is what stops being an upper
+    /// bound.
     fn burn_position(env: &Env, from: &Address, amount: i128) {
         let from_balance = Self::read_balance(env, from);
         if from_balance < amount {

@@ -92,6 +92,10 @@ pub enum Error {
     Insolvent = 9,
     /// `yield_fee_bps` was negative or above [`MAX_YIELD_FEE_BPS`].
     InvalidFee = 10,
+    /// A fee-bearing market named a `fee_recipient` that would break the
+    /// `escrow_out == ledger_debit` identity (the tokenizer itself) or strand
+    /// the fee in a contract that cannot move it (one of this market's tokens).
+    InvalidFeeRecipient = 11,
 }
 
 #[contract]
@@ -126,6 +130,31 @@ impl Tokenizer {
 
         if !(0..=MAX_YIELD_FEE_BPS).contains(&yield_fee_bps) {
             return Err(Error::InvalidFee);
+        }
+
+        // Reject recipients that break the accounting identity the fee relies
+        // on: `escrow_out == ledger_debit`. Paying the tokenizer itself makes
+        // the push a self-transfer, so the YT ledger is debited the gross while
+        // only the net actually leaves escrow — the difference is not lost, but
+        // it silently inflates the next claimant's surplus and the apparent PT
+        // coverage, unattributed. Paying a token in this market strands the
+        // shares in a contract that cannot move them. This is the last moment
+        // either can be caught: `fee_recipient` is immutable after this call.
+        //
+        // Scope, deliberately: these are the addresses this signature can see.
+        // The strategy and the underlying token strand the fee just as
+        // completely, and the AMM would absorb it into LP reserves via
+        // `reconcile_reserves` — but the tokenizer is never told any of them,
+        // and taking them as parameters would invert the dependency (the AMM
+        // names the tokenizer, not the reverse). `scripts/deploy-market.sh`
+        // carries the check for those, where all the addresses are in hand.
+        if yield_fee_bps > 0
+            && (fee_recipient == env.current_contract_address()
+                || fee_recipient == sy_token
+                || fee_recipient == pt_token
+                || fee_recipient == yt_token)
+        {
+            return Err(Error::InvalidFeeRecipient);
         }
 
         let config = Config {
@@ -824,6 +853,75 @@ mod test {
         let fixture = fixture(NOW);
         initialize_with_fee(&fixture, MAX_YIELD_FEE_BPS);
         assert_eq!(fixture.client.config().yield_fee_bps, MAX_YIELD_FEE_BPS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn a_fee_market_cannot_pay_itself() {
+        // Paying the tokenizer would make the fee push a self-transfer: the YT
+        // ledger debits the gross while only the net leaves escrow, quietly
+        // breaking escrow_out == ledger_debit. Immutable after init, so the
+        // only place to catch it is here.
+        let fixture = fixture(NOW);
+        fixture.client.initialize(
+            &fixture.admin,
+            &fixture.sy_token,
+            &fixture.pt_token,
+            &fixture.yt_token,
+            &MATURITY,
+            &fixture.client.address,
+            &500_i128,
+        );
+    }
+
+    #[test]
+    fn a_fee_market_cannot_pay_one_of_its_own_tokens() {
+        // Shares sent to PT/YT/SY are stranded — none of those contracts can
+        // move an SY balance back out. All three clauses are exercised: with
+        // only one covered, deleting either of the others left the suite green.
+        for which in ["sy", "pt", "yt"] {
+            let fixture = fixture(NOW);
+            let target = match which {
+                "sy" => fixture.sy_token.clone(),
+                "pt" => fixture.pt_token.clone(),
+                _ => fixture.yt_token.clone(),
+            };
+            let result = fixture.client.try_initialize(
+                &fixture.admin,
+                &fixture.sy_token,
+                &fixture.pt_token,
+                &fixture.yt_token,
+                &MATURITY,
+                &target,
+                &500_i128,
+            );
+            // Assert the CODE, not just that it failed: with `is_err()` alone,
+            // changing the guard to return InvalidFee left this test green.
+            assert_eq!(
+                result,
+                Err(Ok(Error::InvalidFeeRecipient)),
+                "a fee market must refuse to pay its own {which} token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fee_free_market_may_name_any_recipient() {
+        // At 0 bps nothing is ever pushed, so the guard would only add a
+        // deploy-time failure with no corresponding hazard. Name the tokenizer
+        // itself — the address the guard rejects above — to pin that the check
+        // is gated on the fee actually being charged.
+        let fixture = fixture(NOW);
+        fixture.client.initialize(
+            &fixture.admin,
+            &fixture.sy_token,
+            &fixture.pt_token,
+            &fixture.yt_token,
+            &MATURITY,
+            &fixture.client.address,
+            &0_i128,
+        );
+        assert_eq!(fixture.client.config().yield_fee_bps, 0);
     }
 
     #[test]

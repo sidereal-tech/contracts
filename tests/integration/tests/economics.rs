@@ -1490,3 +1490,136 @@ fn a_zero_fee_market_pays_the_holder_everything() {
         "no fee is paid, and the recipient is never credited"
     );
 }
+
+/// The fee path had no property coverage: every fuzz and conservation test runs
+/// through `deploy()`, which is fee-free, so the random walk had never executed
+/// a single line of the skim. This walks a fee-bearing market through rate rises
+/// AND regressions, claiming at every step, and asserts the identity the fee
+/// depends on — every stroop that leaves escrow lands on either the holder or
+/// the recipient — plus the seniority bound, at every transition.
+#[test]
+fn a_fee_bearing_market_conserves_escrow_across_a_rate_walk() {
+    let m = deploy_with_fee(FEE_500_BPS);
+    let alice = m.fund(100 * UNIT);
+    let bob = m.fund(100 * UNIT);
+    m.deposit(&alice, 100 * UNIT);
+    m.deposit(&bob, 100 * UNIT);
+    m.split(&alice, 100 * UNIT);
+    m.split(&bob, 100 * UNIT);
+
+    // Up, down, up again: a regression is the case where `pay` is capped by the
+    // surplus, which is precisely where a fee could eat into PT if it were
+    // taken from `owed` instead of from `pay`.
+    // Alice claims at each rising step, draining escrow at the peak. The walk
+    // then ends at a rate where the arithmetic leaves barely anything: escrow
+    // sits near 1.769e9 after her claims, so the PT reservation (2e9 / rate)
+    // only drops below it above ~1.1305. At 1.1315 the surplus is ~1.67M
+    // against Bob's owed of ~122.8M.
+    //
+    // That rate is chosen deliberately, not just for being a partial cap. A fee
+    // taken from `owed` instead of `pay` is `owed * bps` regardless of what the
+    // surplus can afford, so once `pay < owed * bps / 10_000` the fee exceeds
+    // the whole payout: `net` goes negative, the `if net > 0` guard skips the
+    // holder push, and `push_token(fee)` still fires -- taking escrow BELOW the
+    // PT reservation and returning a negative number. That only happens in a
+    // narrow band just above the crossover, roughly (1.1305, 1.1315). A partial
+    // cap further up (1.14, say) is caught only by the bps-ratio assertion,
+    // because there `net + fee == pay` still holds and PT is never touched.
+    let walk = [
+        1_050_000_000_000_000_000i128,
+        1_200_000_000_000_000_000,
+        1_300_000_000_000_000_000,
+        1_100_000_000_000_000_000, // regression: escrow short, claims pay nothing
+        1_131_500_000_000_000_000, // partial cap, and inside the PT-breach band
+    ];
+
+    let mut protocol_total = 0i128;
+    let mut saw_partial_cap = false;
+    let mut high_water = m.rate();
+    let yt = YtTokenClient::new(&m.env, &m.yt);
+
+    // Only Alice claims during the walk. Bob keeps a basis from rate 1.0 and
+    // never settles, so his owed grows while Alice's claims drain escrow —
+    // which is what eventually produces a surplus that is positive but smaller
+    // than what he is owed. Without that asymmetry every claim is either
+    // fully paid or paid nothing, and the partial-cap arm this test exists to
+    // cover is never entered.
+    for (step, rate) in walk.iter().enumerate() {
+        m.set_rate(*rate);
+        if *rate > high_water {
+            high_water = *rate;
+        }
+
+        for (who, holder) in [("alice", &alice), ("bob", &bob)] {
+            // Bob only claims on the final step.
+            if who == "bob" && step + 1 < walk.len() {
+                continue;
+            }
+
+            let owed_before = yt.preview_claim_yield(holder);
+            let escrow_before = m.escrow_shares();
+            let holder_before = m.sy_balance(holder);
+            let fee_before = m.sy_balance(&m.fee_recipient);
+
+            let returned = m.claim(holder);
+
+            let escrow_out = escrow_before - m.escrow_shares();
+            let to_holder = m.sy_balance(holder) - holder_before;
+            let to_protocol = m.sy_balance(&m.fee_recipient) - fee_before;
+            protocol_total += to_protocol;
+            if escrow_out > 0 && escrow_out < owed_before {
+                saw_partial_cap = true;
+            }
+
+            assert_eq!(
+                returned, to_holder,
+                "step {step} {who}: claim_yield must return the NET the holder received"
+            );
+            assert_eq!(
+                escrow_out,
+                to_holder + to_protocol,
+                "step {step} {who}: every stroop leaving escrow lands on the holder or the protocol"
+            );
+            assert!(
+                to_protocol * 10_000 <= (to_holder + to_protocol) * FEE_500_BPS,
+                "step {step} {who}: the protocol never takes more than its bps of the payout"
+            );
+
+            let reservation = pt_face_reservation(m.pt_supply(), *rate);
+            if escrow_before >= reservation {
+                assert!(
+                    m.escrow_shares() >= reservation,
+                    "step {step} {who}: the claim pushed escrow {} below the PT reservation {}",
+                    m.escrow_shares(),
+                    reservation
+                );
+            } else {
+                assert_eq!(
+                    escrow_out, 0,
+                    "step {step} {who}: escrow was already short, so the claim must pay nothing"
+                );
+            }
+        }
+
+        // The rate-INDEPENDENT ledger invariant holds at every step, including
+        // the regressions, because `consume` takes the gross. The fuzz asserts
+        // this one ungated and only gates the rate-priced form below; keeping
+        // just the gated half would leave the regression steps asserting
+        // nothing at all.
+        m.assert_escrow_covers_yt_ledger();
+        if *rate >= high_water {
+            m.assert_escrow_covers(&[&alice, &bob]);
+        }
+    }
+
+    assert!(
+        protocol_total > 0,
+        "the walk must actually exercise the fee path, not just the zero branch"
+    );
+    assert!(
+        saw_partial_cap,
+        "the walk never produced a partial cap (0 < pay < owed), so the arm where \
+         a fee could eat into PT is untested -- taking the fee from `owed` instead \
+         of `pay` would pass this test"
+    );
+}

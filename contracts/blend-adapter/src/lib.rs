@@ -144,8 +144,31 @@ pub fn assets_from_b_tokens(b_tokens: i128, b_rate: i128) -> Option<i128> {
 /// reachable through the permissionless `bad_debt` pool entrypoint once the
 /// backstop is drained, and it hits plain supply positions too. A decline is
 /// therefore a real operating state, not an impossible one: the vault stays
-/// solvent and simply pays less, but consumers that reject a regression
-/// (YT's checkpoint, the AMM's rate floors) will halt until it recovers.
+/// solvent and simply pays less.
+///
+/// What halts on a decline, verified rather than assumed — the two failure
+/// modes this comment used to name were both wrong after the August 2026 fixes:
+/// YT no longer rejects a regression at all (the yield-basis rewrite replaced
+/// the checkpoint, and `ExchangeRateRegression` is now dead code), and the AMM
+/// halt is not its rate floor but its **market-proportion cap**: the curve
+/// values the SY reserve at this rate, so a falling rate pushes the PT
+/// proportion up into `MAX_MARKET_PROPORTION`.
+///
+/// What that cap does and does not stop, precisely — the curve computes the
+/// proportion from `total_pt - net_pt_to_account`, so the trade size matters:
+/// PT *sells* and *small* PT buys revert, but a large enough PT **buy** pulls
+/// the proportion back under the cap and prices normally. That is also the
+/// trade that recovers the market, which is why `exact_sy_in_pt_out_or_panic`
+/// searches for it rather than giving up. Proportional `add_liquidity` and
+/// `remove_liquidity` never read the rate and keep working throughout; the
+/// seed branch of `add_liquidity` does read it, so seeding a market can fail
+/// while trading one still succeeds.
+///
+/// `swap_yt_for_sy` halts separately, on `sy_from_recombine < sy_value`
+/// (`InsufficientLiquidity`) — the tokenizer's pro-rata cap under an escrow
+/// shortfall, an escrow-coverage condition rather than a statement about what
+/// YT is worth. Everything else — claims, split, recombine, redemption, the
+/// freeze — keeps working through a decline.
 pub fn derived_exchange_rate(aum: i128, sy_supply: i128) -> Option<i128> {
     if sy_supply <= 0 {
         return Some(WAD);

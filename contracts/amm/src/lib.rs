@@ -577,6 +577,18 @@ impl Market for AmmMarket {
             );
             state.twap_ln_implied_rate = state.last_ln_implied_rate;
             state.last_observation = now;
+            // Re-arm warm-up from the SEED, not from initialize. The seeder
+            // picks this observation unilaterally — any implied rate the curve
+            // admits, at whatever proportion they choose — and can remove the
+            // liquidity again afterwards. `initialize` armed warm-up at deploy
+            // time, and deploy scripts do not seed in the same transaction, so a
+            // market seeded more than one window later reported
+            // `twap_warming_up() == false` at the exact instant one account had
+            // just set the oracle from nothing. A single observation deciding
+            // the TWAP is the manipulation window warm-up exists to close, and
+            // it is the same reasoning the idle-gap branch of `sync_twap`
+            // already applies.
+            state.warmup_until = now + config.twap_window;
 
             (pt_in, sy_in, gross_lp - MINIMUM_LIQUIDITY)
         } else {
@@ -1006,14 +1018,30 @@ fn exact_sy_in_pt_out_or_panic(
     let mut high = checked_sub(env, state.total_pt, 1);
     let mut best = 0;
 
+    // One binary search, over a probe that says WHICH side it failed on.
+    //
+    // The candidate range partitions as
+    //
+    //     [too small: over the cap][affordable][too expensive][too large: rate < WAD]
+    //
+    // because raising `pt_out` both relieves the proportion and costs more. Each
+    // arm therefore has an unambiguous direction, which is all a binary search
+    // needs. Two earlier attempts failed here: collapsing "does not price" into
+    // "too expensive" searched away from the only fills that exist, and a
+    // doubling gallop only ever landed on powers of two, so it missed any band
+    // that contained none — 17% of over-cap states, including a 3,618-wide band
+    // in this function's own regression fixture.
     while low <= high {
         let mid = low + ((high - low) / 2);
-        match try_exact_pt_out_sy_in(env, config, state, comp, mid) {
-            Some(required_sy) if required_sy <= sy_in => {
+        match probe_pt_out(env, config, state, comp, mid) {
+            PtOutProbe::TooSmall => {
+                low = mid + 1;
+            }
+            PtOutProbe::Priced(required_sy) if required_sy <= sy_in => {
                 best = mid;
                 low = mid + 1;
             }
-            Some(_) | None => {
+            PtOutProbe::Priced(_) | PtOutProbe::TooLarge => {
                 high = mid - 1;
             }
         }
@@ -1073,6 +1101,124 @@ fn exact_pt_out_sy_in_or_panic(
     }
 }
 
+/// Why a candidate `pt_out` was rejected, or what it costs.
+///
+/// `try_get_exchange_rate` returns `None` for two opposite reasons — the market
+/// proportion being over the cap, and the resulting implied rate falling under
+/// WAD — and for a PT *buy* they sit at opposite ends of the candidate range:
+/// buying more PT lowers the proportion, which relieves the first and eventually
+/// triggers the second. Collapsing them into one `None` is what made every
+/// search over this range wrong, because no single direction is correct for it.
+enum PtOutProbe {
+    /// A proportion is still over the cap. Buying MORE PT relieves it.
+    TooSmall,
+    /// Prices: the SY shares the pool charges for this fill.
+    Priced(i128),
+    /// An implied rate fell under WAD. Buy LESS PT.
+    TooLarge,
+}
+
+/// Answers exactly one question: is the market proportion ABOVE the cap?
+///
+/// Deliberately not "would `try_get_exchange_rate` reject this", which is what
+/// an earlier version computed. That function rejects for several reasons and
+/// they do not all point the same way, so folding them together here reproduced
+/// the bug this split exists to fix. In particular `proportion == 0` — which
+/// happens when `(total_pt - pt_out) * WAD < total_pt + total_asset`, i.e. for
+/// the top few candidates on a pool near `MAX_RESERVE_UNITS` — is a SUFFIX
+/// condition. Reporting it as over-cap made the search treat the very largest
+/// fills as "too small" and walk up past the affordable band.
+///
+/// Every arm other than a genuine over-cap therefore returns `false` and lets
+/// the decision fall through to `try_get_exchange_rate`, whose `None` the
+/// caller maps to `TooLarge` — the correct direction for all of them.
+fn proportion_over_cap(total_pt: i128, total_asset: i128, net_pt_to_account: i128) -> bool {
+    let numerator = match total_pt.checked_sub(net_pt_to_account) {
+        Some(value) => value,
+        None => return false,
+    };
+    let denominator = match total_pt.checked_add(total_asset) {
+        Some(value) => value,
+        None => return false,
+    };
+    if numerator <= 0 || denominator <= 0 {
+        return false;
+    }
+    match numerator.checked_mul(WAD) {
+        Some(scaled) => scaled / denominator > MAX_MARKET_PROPORTION,
+        None => false,
+    }
+}
+
+/// Prices a candidate `pt_out`, reporting which side of the feasible band a
+/// rejection falls on. `try_exact_pt_out_sy_in` is the `Option` view of this, so
+/// there is one implementation and the cost can never drift between them.
+fn probe_pt_out(
+    env: &Env,
+    config: &Config,
+    state: &State,
+    comp: &Precompute,
+    pt_out: i128,
+) -> PtOutProbe {
+    if pt_out <= 0 {
+        return PtOutProbe::TooSmall;
+    }
+    if pt_out >= state.total_pt {
+        return PtOutProbe::TooLarge;
+    }
+
+    if proportion_over_cap(state.total_pt, comp.total_asset, pt_out) {
+        return PtOutProbe::TooSmall;
+    }
+    let exchange_rate = match try_get_exchange_rate(
+        env,
+        state.total_pt,
+        comp.total_asset,
+        comp.rate_scalar,
+        comp.rate_anchor,
+        pt_out,
+    ) {
+        Some(rate) => rate,
+        // The proportion cleared just above, so the only remaining rejection in
+        // there is the rate falling under WAD — the far end of the range.
+        None => return PtOutProbe::TooLarge,
+    };
+
+    let pre_fee_asset_in = mul_div_up_or_panic(env, pt_out, WAD, exchange_rate);
+    let fee = mul_div_up_or_panic(env, pre_fee_asset_in, config.fee_bps, BPS_DENOMINATOR);
+    let asset_in = checked_add(env, pre_fee_asset_in, fee);
+    let sy_in = shares_in_for_face_up(env, asset_in, comp.sy_rate);
+
+    let post_pt = state.total_pt - pt_out;
+    let post_shares = checked_add(env, state.total_sy, sy_in);
+    if post_pt <= 0 || post_shares <= 0 {
+        return PtOutProbe::TooLarge;
+    }
+    let post_asset = asset_value_of_shares(env, post_shares, comp.sy_rate);
+    if post_asset <= 0 {
+        return PtOutProbe::TooLarge;
+    }
+    // The post-trade proportion is the tighter of the two cap checks, so this is
+    // usually what sets the band's lower edge.
+    if proportion_over_cap(post_pt, post_asset, 0) {
+        return PtOutProbe::TooSmall;
+    }
+    if try_get_exchange_rate(
+        env,
+        post_pt,
+        post_asset,
+        comp.rate_scalar,
+        comp.rate_anchor,
+        0,
+    )
+    .is_none()
+    {
+        return PtOutProbe::TooLarge;
+    }
+
+    PtOutProbe::Priced(sy_in)
+}
+
 fn try_exact_pt_out_sy_in(
     env: &Env,
     config: &Config,
@@ -1080,35 +1226,10 @@ fn try_exact_pt_out_sy_in(
     comp: &Precompute,
     pt_out: i128,
 ) -> Option<i128> {
-    if pt_out <= 0 || pt_out >= state.total_pt {
-        return None;
+    match probe_pt_out(env, config, state, comp, pt_out) {
+        PtOutProbe::Priced(sy_in) => Some(sy_in),
+        PtOutProbe::TooSmall | PtOutProbe::TooLarge => None,
     }
-
-    let exchange_rate = try_get_exchange_rate(
-        env,
-        state.total_pt,
-        comp.total_asset,
-        comp.rate_scalar,
-        comp.rate_anchor,
-        pt_out,
-    )?;
-    // Asset units on the curve, ceiled at every step, then converted back to
-    // the SY shares the pool charges — also ceiled, mirroring the shares a
-    // `tokenizer::split` would have to escrow to mint the same face. Both
-    // roundings are toward the pool.
-    let pre_fee_asset_in = mul_div_up_or_panic(env, pt_out, WAD, exchange_rate);
-    let fee = mul_div_up_or_panic(env, pre_fee_asset_in, config.fee_bps, BPS_DENOMINATOR);
-    let asset_in = checked_add(env, pre_fee_asset_in, fee);
-    let sy_in = shares_in_for_face_up(env, asset_in, comp.sy_rate);
-    if !post_trade_rate_is_representable(
-        env,
-        comp,
-        state.total_pt - pt_out,
-        checked_add(env, state.total_sy, sy_in),
-    ) {
-        return None;
-    }
-    Some(sy_in)
 }
 
 /// Where a candidate YT size sits relative to the buyer's budget.
@@ -1121,15 +1242,31 @@ fn try_exact_pt_out_sy_in(
 /// cost(face) = ceil(face * WAD / rate) - curve_proceeds(face)
 /// ```
 ///
-/// is non-decreasing in `face`: the split cost is linear, and the curve's
-/// proceeds per unit of face *fall* as more PT is pushed into the pool. So the
-/// affordable set is an interval whose lower edge is only ever set by integer
-/// rounding (a face so small the curve's proceeds floor to zero, or so small
-/// the fee-free proceeds still cover the split) and whose upper edge is the
-/// budget or the pool's liquidity. `TooSmall` therefore always means "search
-/// up" and `TooLarge` always means "search down" — the assumption the previous
+/// is strictly increasing in `face` *as a continuous function*: the split cost
+/// is linear, and the curve's proceeds per unit of face fall as more PT is
+/// pushed into the pool. So the affordable set is an interval whose lower edge
+/// is set by integer rounding (a face so small the curve's proceeds floor to
+/// zero, or so small the fee-free proceeds still cover the split) and whose
+/// upper edge is the budget or the pool's liquidity. `TooSmall` means "search
+/// up" and `TooLarge` means "search down" — the assumption the previous
 /// prefix-only search made unconditionally, and which was false at rates above
 /// 1.0 because the whole feasible set could sit above the first probe.
+///
+/// **Caveat, measured:** the discrete `cost` is not *monotone*. The ceil/floor
+/// pair jitters it by about a stroop, so on a cost plateau the comparison
+/// against `sy_in` can alternate — e.g. pool 1000/1000, R = 1.05, anchor 1.05,
+/// 90-day, zero fee: `cost(20) = 2` but `cost(21) = 1`. With a budget sitting
+/// inside that jitter the partition reads `A A L L A A A L L L`, not
+/// `S* A* L*`, and the search can return a non-maximal size or miss a feasible
+/// one entirely (worst observed gap 1434 stroops, widening near maturity where
+/// plateaus are longer).
+///
+/// This is bounded and one-directional: `best` is only ever set from a probe
+/// that came back `Affordable`, and the buyer is charged exactly that probe's
+/// cost, so **the pool is never short-changed** — the buyer just occasionally
+/// gets less YT than the true maximum. `quote_sy_for_yt` runs this same solver,
+/// so a quote can never disagree with execution. Closing it properly means
+/// clamping the low edge before the search rather than trusting monotonicity.
 enum YtBuyProbe {
     /// Below the affordable interval: the split's face is too small for the
     /// curve leg to return anything the pool can safely account for.
@@ -3138,6 +3275,99 @@ mod test {
                  the redemption value {redemption} (floor {floor})"
             );
         }
+    }
+
+    /// The band's lower edge is found by searching the proportion guard, not by
+    /// probing for the band. A doubling gallop only ever lands on powers of two,
+    /// so it missed any band containing none — here the priced band is
+    /// [4238, 7855], which sits entirely between 4096 and 8192. Measured at 17%
+    /// of over-cap states, and every rate in 0.028..=0.033 on this fixture.
+    /// `proportion_over_cap` answers "is the proportion above the cap", and
+    /// nothing else. Every other rejection has to fall through to
+    /// `try_get_exchange_rate` so the caller maps it to `TooLarge`.
+    ///
+    /// The arm that matters is `proportion == 0`, which happens for the top few
+    /// candidates once `(total_pt - pt_out) * WAD < total_pt + total_asset` —
+    /// only reachable on a pool near MAX_RESERVE_UNITS. It is a SUFFIX, so
+    /// reporting it as over-cap sent the search upward past the affordable band
+    /// and cost the buyer up to ~170 stroops of PT.
+    #[test]
+    fn proportion_over_cap_reports_only_a_genuine_over_cap() {
+        // A balanced pool is nowhere near the cap.
+        assert!(!proportion_over_cap(1_000, 1_000, 0));
+        // Almost all PT: over the cap, and buying more PT is what relieves it.
+        assert!(proportion_over_cap(1_000, 1, 0));
+        assert!(!proportion_over_cap(1_000, 1, 990));
+
+        // The degenerate top edge: the proportion floors to zero. This is the
+        // LARGEST fills, not the smallest, so it must not read as over-cap.
+        let big = MAX_RESERVE_UNITS;
+        assert_eq!(
+            (big - (big - 1)) * WAD < big + big,
+            true,
+            "precondition: the top candidate floors the proportion to zero"
+        );
+        assert!(
+            !proportion_over_cap(big, big, big - 1),
+            "a proportion of zero is the top of the range, not the bottom"
+        );
+
+        // Overflow arms likewise fall through rather than claiming over-cap.
+        assert!(!proportion_over_cap(i128::MAX, i128::MAX, 0));
+        assert!(!proportion_over_cap(1_000, 1_000, i128::MIN));
+    }
+
+    #[test]
+    fn buying_pt_works_when_the_priced_band_contains_no_power_of_two() {
+        for rate_thousandths in [28i128, 30, 31, 33] {
+            let fixture = seeded_market_at_rate(NOW, WAD, 500_000, 500_000);
+            set_sy_rate(&fixture, WAD * rate_thousandths / 1000);
+            mint_sy_shares(&fixture, &fixture.bob, 500_000);
+
+            let budget = 238_273i128;
+            let quoted = fixture.client.quote_sy_for_pt(&budget);
+            assert!(
+                quoted > 0,
+                "rate 0.{rate_thousandths:03}: a band with no power of two in it must still quote"
+            );
+            let got = fixture.client.swap_sy_for_pt(&fixture.bob, &budget, &1);
+            assert_eq!(
+                got, quoted,
+                "rate 0.{rate_thousandths:03}: quote and execution must agree"
+            );
+        }
+    }
+
+    /// A fallen SY rate shrinks the asset-valued SY reserve and pushes the
+    /// pre-trade pool past MAX_MARKET_PROPORTION. Small `pt_out` then does not
+    /// price at all while large `pt_out` does, so a search that treats "does not
+    /// price" as "too expensive" walks away from the only fills that exist.
+    /// Buying PT is also the trade that pulls the proportion back under the cap,
+    /// so refusing it is what would strand the market.
+    #[test]
+    fn buying_pt_still_works_when_a_fallen_rate_puts_the_pool_over_the_proportion_cap() {
+        let fixture = seeded_market_at_rate(NOW, WAD, 500_000, 500_000);
+        // Collapse the SY rate so the asset-denominated SY reserve nearly
+        // vanishes and the PT proportion climbs past the cap.
+        set_sy_rate(&fixture, WAD * 36 / 1000);
+        mint_sy_shares(&fixture, &fixture.bob, 200_000);
+
+        let budget = 79_500i128;
+        let quoted = fixture.client.quote_sy_for_pt(&budget);
+        assert!(
+            quoted > 0,
+            "a pool over the proportion cap must still quote a large enough PT buy"
+        );
+
+        let got = fixture.client.swap_sy_for_pt(&fixture.bob, &budget, &1);
+        assert_eq!(got, quoted, "quote and execution must agree here too");
+
+        // Buying PT is the trade that pulls the proportion back under the cap,
+        // so refusing it is what would strand the market.
+        assert!(
+            fixture.client.quote_sy_for_pt(&budget) > 0,
+            "the market must remain tradable after the recovering trade"
+        );
     }
 
     /// The AMM must keep its share-denominated state honest while the curve
