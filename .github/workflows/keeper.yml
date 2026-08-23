@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+name: keeper
+
+# Market upkeep on a timer. The 2026-08-09 pilot maturity passed unattended and
+# its YT settled at roughly 2% of what it earned, because `freeze_maturity_rate`
+# is permissionless and therefore nobody's job. This workflow is what makes it
+# somebody's job.
+on:
+  schedule:
+    # Every 6 hours. The binding constraint is the maturity freeze: the frozen
+    # rate is the last observation taken before maturity, so this cadence bounds
+    # how stale that observation can be. Six hours on a 45-day market is well
+    # inside the noise. Raising the frequency mostly buys extra `touch` and
+    # `observe_rate` transactions, since the keeper sends them every run rather
+    # than checking whether they are due.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Send transactions (unchecked = read-only report)"
+        type: boolean
+        default: false
+      market:
+        description: "Limit to one market key, e.g. testnet/blend-usdc-testnet-q4"
+        type: string
+        required: false
+
+# Never let two upkeep runs overlap. Both would independently decide a rate
+# needs freezing or a head needs pruning, and both would send. Queue instead of
+# cancelling: cancelling mid-run could kill the process between a submitted
+# transaction and its confirmation.
+concurrency:
+  group: keeper
+  cancel-in-progress: false
+
+jobs:
+  upkeep:
+    name: market upkeep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install stellar-cli
+        run: |
+          curl -fsSL -o /tmp/stellar-cli.tar.gz \
+            https://github.com/stellar/stellar-cli/releases/download/v27.0.0/stellar-cli-27.0.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
+          sudo install /tmp/stellar /usr/local/bin/stellar
+          stellar version
+
+      # Fail loudly rather than skipping. A keeper that cannot sign is a keeper
+      # that is not running, and the entire cost of the pilot was not noticing
+      # exactly that. A red scheduled job is the signal.
+      - name: Import the keeper identity
+        env:
+          KEEPER_SECRET_KEY: ${{ secrets.KEEPER_SECRET_KEY }}
+        run: |
+          if [[ -z "${KEEPER_SECRET_KEY:-}" ]]; then
+            echo "::error::secrets.KEEPER_SECRET_KEY is not set. The keeper cannot sign or even simulate without a source account. Add the secret, or disable this workflow deliberately."
+            exit 1
+          fi
+          printf '%s\n' "$KEEPER_SECRET_KEY" | stellar keys add sidereal-keeper --secret-key
+          echo "keeper address: $(stellar keys address sidereal-keeper)"
+
+      - name: Run upkeep
+        env:
+          DEPLOY_IDENTITY: sidereal-keeper
+          # The stellar-cli `mainnet` alias ships with no RPC URL, so without
+          # this a mainnet market fails instead of being silently skipped.
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+        run: |
+          args=()
+          # A scheduled run always applies. Manual runs are read-only unless the
+          # operator opts in, so the dispatch button is safe to press.
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.apply }}" == "true" ]]; then
+            args+=(--run)
+          fi
+          if [[ -n "${{ inputs.market }}" ]]; then
+            args+=(--market "${{ inputs.market }}")
+          fi
+          echo "keeper ${args[*]}"
+          node scripts/keeper.mjs "${args[@]}" | tee keeper-report.txt
+
+      # Written even when upkeep fails, so a red run still leaves the evidence
+      # of which invariant broke.
+      - name: Machine-readable report
+        if: always()
+        env:
+          DEPLOY_IDENTITY: sidereal-keeper
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+        run: node scripts/keeper.mjs --json > keeper-report.json || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keeper-report-${{ github.run_id }}
+          path: |
+            keeper-report.txt
+            keeper-report.json
+          retention-days: 30
