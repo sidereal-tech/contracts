@@ -17,5 +17,12 @@ app/.env.local
 deployments/*.state.env
 deployments/*.tmp
 deployments/*.tmp.*
+# V2 keys state by MARKET_ID under deployments/markets/<network>/, which the
+# flat globs above do not reach. Without these, every deploy leaves an untracked
+# state file behind, and deploy-market.sh counts untracked files as dirty -- so
+# one deploy blocks the next one from starting.
+deployments/markets/*/*.state.env
+deployments/markets/*/*.tmp
+deployments/markets/*/*.tmp.*
 .vercel
 docs/LOCAL_TEST_WALLETS.md
