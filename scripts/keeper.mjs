@@ -18,6 +18,10 @@
 //                     to Blend/DeFindex; nothing else can renew it for us.
 //   4. Maturity     — observe_rate before maturity so a fresh observation always
 //                     exists, freeze_maturity_rate immediately after.
+//   5. Orderbook    — prune_expired when the head of either side has expired.
+//                     Permissionless, and a liveness duty rather than a tidiness
+//                     one: fill_best rejects an expired head instead of skipping
+//                     it, so one stale order halts that side of the book.
 //
 // Usage:
 //   node scripts/keeper.mjs                        # check every market, report only
@@ -69,6 +73,13 @@ function keeperAddress() {
 const LIQUIDITY_FLOOR_BPS = BigInt(process.env.LIQUIDITY_FLOOR_BPS ?? "2000"); // 20%
 /** Freeze the maturity rate once we are this far past maturity. */
 const FREEZE_GRACE_SECONDS = Number(process.env.FREEZE_GRACE_SECONDS ?? "0");
+/**
+ * Orders to clear per prune call. The contract caps this at MAX_PAGE_SIZE (50)
+ * and rejects anything larger with PageTooLarge, so this is a ceiling, not a
+ * suggestion. Kept at the cap because pruning is cheap and a partially cleared
+ * head leaves the book blocked until the next run.
+ */
+const ORDERBOOK_PRUNE_LIMIT = Number(process.env.ORDERBOOK_PRUNE_LIMIT ?? "50");
 
 const findings = [];
 const actions = [];
@@ -229,6 +240,36 @@ function tryInvoke(network, contractId, fn, opts) {
     const text = String(error.stderr ?? error.message ?? error);
     return { ok: false, error: text.split("\n").slice(-4).join(" ").trim() };
   }
+}
+
+/**
+ * Parse a contract return that is a struct or an `Option<T>`, not a scalar.
+ * `invoke` strips surrounding quotes, which is right for scalars and harmless
+ * for JSON objects. Returns null for an absent option, an unparseable payload,
+ * or an empty read -- every caller here treats "no head order" and "could not
+ * tell" the same way, which is to do nothing rather than guess.
+ */
+function parseJson(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (text === "" || text === "null" || text === "void") return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed === null ? null : parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * u64 fields cross the CLI boundary as either a JSON number or a decimal
+ * string depending on magnitude. Number() handles both; the finite check keeps
+ * a malformed field from being compared as NaN, which is false against every
+ * operator and would silently read as "not expired".
+ */
+function asSeconds(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 const big = (value) => {
@@ -403,6 +444,100 @@ function checkMarket(market) {
     } else {
       actions.push({ market: market.key, action: "freeze_maturity_rate", result: "would send" });
       note("warn", market.key, "matured and NOT frozen — run with --run to freeze");
+    }
+  }
+
+  // 6. Resting-orderbook upkeep. Markets deployed before the orderbook landed
+  //    legitimately have no `contracts.orderbook`, and deployments/README says
+  //    clients must treat those manifests as legacy rather than as broken.
+  if (contracts.orderbook) {
+    checkOrderbook(market);
+  }
+}
+
+/**
+ * Duty 6: keep the head of each side of the book fillable.
+ *
+ * `prune_expired` refunds the maker, which alone would make it keeper work.
+ * What makes it urgent is liveness, not tidiness: `fill_best` reads the head
+ * order and rejects an expired one with `OrderExpired` instead of skipping past
+ * it, so a single stale order at the front halts *every* fill on that side
+ * until somebody prunes it. It is permissionless, so nobody is paid to notice,
+ * and the makers behind it have no way to make their own orders reachable.
+ *
+ * Pruning walks from the head and stops at the first unexpired order. It
+ * therefore cannot clear an expired order sitting deeper in the book, which is
+ * correct: that order blocks nothing while it is not the head, and becomes
+ * prunable the moment it becomes one.
+ *
+ * This duty stays live after maturity. `place_order` and `fill_best` go through
+ * `read_live_config` and stop at maturity, but `prune_expired` reads the plain
+ * config, so expired escrow is still refundable once the market has matured --
+ * which is exactly when the last makers need their collateral back.
+ */
+function checkOrderbook(market) {
+  const { network, contracts } = market;
+
+  const open = tryInvoke(network, contracts.orderbook, "open_count");
+  if (!open.ok) {
+    note("fail", market.key, `orderbook open_count unreadable: ${open.error}`);
+    return;
+  }
+  note("ok", market.key, `orderbook: ${open.value} open order(s)`);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  for (const side of ["Ask", "Bid"]) {
+    const best = tryInvoke(network, contracts.orderbook, "best_order", {
+      args: ["--side", side],
+    });
+    if (!best.ok) {
+      note("warn", market.key, `orderbook best_order(${side}) unreadable: ${best.error}`);
+      continue;
+    }
+
+    const head = parseJson(best.value);
+    if (head === null) continue; // Empty side: nothing to keep fillable.
+
+    const expiry = asSeconds(head.expiry);
+    if (expiry === null) {
+      note("warn", market.key, `orderbook ${side} head has an unreadable expiry`);
+      continue;
+    }
+    if (expiry > nowSec) {
+      const hours = ((expiry - nowSec) / 3600).toFixed(1);
+      note("ok", market.key, `orderbook ${side} head expires in ${hours}h`);
+      continue;
+    }
+
+    // The head is expired, so this side is blocked right now. Report it at
+    // fail level even when we go on to fix it: a book that reaches this state
+    // was unfillable for however long it took the keeper to run, and that is
+    // worth seeing in the history rather than silently repairing.
+    const staleFor = ((nowSec - expiry) / 3600).toFixed(1);
+    note("fail", market.key, `orderbook ${side} head expired ${staleFor}h ago — that side cannot fill`, {
+      side,
+      orderId: head.id,
+      expiry,
+    });
+
+    if (APPLY) {
+      // Bounded by the contract's own MAX_PAGE_SIZE (50). If more than that
+      // expired at the head, the next run takes the rest; going wider would
+      // just move the transaction-size failure onto us.
+      const pruned = tryInvoke(network, contracts.orderbook, "prune_expired", {
+        send: true,
+        args: ["--side", side, "--max_orders", String(ORDERBOOK_PRUNE_LIMIT)],
+      });
+      if (pruned.ok) {
+        actions.push({ market: market.key, action: `prune_expired:${side}`, result: pruned.value });
+        note("ok", market.key, `pruned ${pruned.value} expired ${side} order(s) and refunded their makers`);
+      } else {
+        note("fail", market.key, `prune_expired(${side}) failed: ${pruned.error}`);
+      }
+    } else {
+      actions.push({ market: market.key, action: `prune_expired:${side}`, result: "would send" });
+      note("warn", market.key, `would prune the expired ${side} head — run with --run to unblock the book`);
     }
   }
 }
