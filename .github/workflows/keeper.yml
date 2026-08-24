@@ -96,7 +96,7 @@ jobs:
           TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
         run: node scripts/keeper.mjs --json > keeper-report.json || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: keeper-report-${{ github.run_id }}
