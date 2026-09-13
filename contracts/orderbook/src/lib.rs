@@ -11,6 +11,10 @@ const WAD: i128 = 1_000_000_000_000_000_000;
 const BPS_DENOMINATOR: i128 = 10_000;
 const MAX_TAKER_FEE_BPS: i128 = 1_000;
 const MAX_PAGE_SIZE: u32 = 50;
+/// `place_order` and `fill_best` reclaim at most this many expired head orders
+/// before doing their own work, so the book self-heals without a separate prune
+/// transaction while each call's extra work stays bounded.
+const MAX_AUTO_PRUNE: u32 = 10;
 /// Orders fit inside the 120-day persistent-entry TTL even if nobody touches
 /// them between placement and expiry.
 const MAX_ORDER_LIFETIME_SECONDS: u64 = 90 * 24 * 60 * 60;
@@ -298,6 +302,9 @@ impl Orderbook {
         if expiry <= now || expiry > config.maturity || expiry - now > MAX_ORDER_LIFETIME_SECONDS {
             return Err(Error::InvalidExpiry);
         }
+        // Reclaim expired orders on the opposite side first so a stale head
+        // cannot reject a placement that does not cross any live order.
+        prune_expired_heads(&env, &config, opposite_side(side), MAX_AUTO_PRUNE)?;
         reject_crossing_order(&env, side, price_wad)?;
 
         let id = next_order_id(&env)?;
@@ -370,6 +377,10 @@ impl Orderbook {
         if limit_price_wad <= 0 {
             return Err(Error::InvalidPrice);
         }
+        // Reclaim expired heads so a stale best order cannot block the live
+        // fills behind it. Bounded; anything past the bound still reports
+        // expired and needs an explicit prune.
+        prune_expired_heads(&env, &config, resting_side, MAX_AUTO_PRUNE)?;
         let id = read_head(&env, resting_side).ok_or(Error::OrderNotFound)?;
         let mut order = read_order(&env, id).ok_or(Error::OrderNotFound)?;
         if order.side != resting_side {
@@ -496,19 +507,7 @@ impl Orderbook {
         if max_orders == 0 || max_orders > MAX_PAGE_SIZE {
             return Err(Error::PageTooLarge);
         }
-        let mut pruned = 0_u32;
-        while pruned < max_orders {
-            let Some(id) = read_head(&env, side) else {
-                break;
-            };
-            let order = read_order(&env, id).ok_or(Error::OrderNotFound)?;
-            if order.expiry > env.ledger().timestamp() {
-                break;
-            }
-            close_order(&env, &config, order, true)?;
-            pruned += 1;
-        }
-        Ok(pruned)
+        prune_expired_heads(&env, &config, side, max_orders)
     }
 }
 
@@ -624,11 +623,15 @@ fn ordered_before(side: Side, left: i128, right: i128, strict: bool) -> bool {
     }
 }
 
-fn reject_crossing_order(env: &Env, side: Side, price_wad: i128) -> Result<(), Error> {
-    let opposite = match side {
+fn opposite_side(side: Side) -> Side {
+    match side {
         Side::Ask => Side::Bid,
         Side::Bid => Side::Ask,
-    };
+    }
+}
+
+fn reject_crossing_order(env: &Env, side: Side, price_wad: i128) -> Result<(), Error> {
+    let opposite = opposite_side(side);
     let Some(best) = read_head(env, opposite).and_then(|id| read_order(env, id)) else {
         return Ok(());
     };
@@ -698,6 +701,29 @@ fn close_order(env: &Env, config: &Config, order: Order, expired: bool) -> Resul
     }
     .publish(env);
     Ok(())
+}
+
+/// Removes up to `max_orders` expired orders from the head of `side`'s book,
+/// refunding each maker exactly its escrow. Returns how many were removed.
+fn prune_expired_heads(
+    env: &Env,
+    config: &Config,
+    side: Side,
+    max_orders: u32,
+) -> Result<u32, Error> {
+    let mut pruned = 0_u32;
+    while pruned < max_orders {
+        let Some(id) = read_head(env, side) else {
+            break;
+        };
+        let order = read_order(env, id).ok_or(Error::OrderNotFound)?;
+        if order.expiry > env.ledger().timestamp() {
+            break;
+        }
+        close_order(env, config, order, true)?;
+        pruned += 1;
+    }
+    Ok(pruned)
 }
 
 fn increment_open_count(env: &Env) -> Result<(), Error> {
@@ -1003,6 +1029,73 @@ mod test {
         assert_eq!(f.client.prune_expired(&Side::Ask, &10), 1);
         assert_eq!(f.client.get_order(&id), None);
         assert_eq!(balance(&f.env, &f.pt, &f.maker), maker_before);
+    }
+
+    #[test]
+    fn fill_best_reclaims_an_expired_head_and_fills_the_next_live_order() {
+        let f = fixture();
+        let maker_before = balance(&f.env, &f.pt, &f.maker);
+        let expired = f.client.place_order(
+            &f.maker,
+            &Side::Ask,
+            &(100 * UNIT),
+            &PRICE,
+            &(NOW + 10),
+            &None,
+        );
+        let live = f.client.place_order(
+            &f.maker_two,
+            &Side::Ask,
+            &(50 * UNIT),
+            &(PRICE + WAD / 100),
+            &(NOW + 1_000),
+            &Some(expired),
+        );
+
+        f.env
+            .ledger()
+            .with_mut(|ledger| ledger.timestamp = NOW + 10);
+        let receipt =
+            f.client
+                .fill_best(&f.taker, &Side::Ask, &(10 * UNIT), &(PRICE + WAD / 100));
+
+        assert_eq!(receipt.order_id, live);
+        assert_eq!(f.client.get_order(&expired), None);
+        assert_eq!(f.client.best_order(&Side::Ask).unwrap().id, live);
+        assert_eq!(balance(&f.env, &f.pt, &f.maker), maker_before);
+    }
+
+    #[test]
+    fn place_order_reclaims_an_expired_opposite_head_before_checking_crosses() {
+        let f = fixture();
+        let maker_before = balance(&f.env, &f.sy, &f.maker);
+        let expired = f.client.place_order(
+            &f.maker,
+            &Side::Bid,
+            &(100 * UNIT),
+            &(PRICE + WAD / 10),
+            &(NOW + 10),
+            &None,
+        );
+
+        f.env
+            .ledger()
+            .with_mut(|ledger| ledger.timestamp = NOW + 10);
+        // Priced through the stale bid, but the bid is expired and reclaimed
+        // before the crossing check, so the ask rests instead of reverting.
+        let ask = f.client.place_order(
+            &f.maker_two,
+            &Side::Ask,
+            &(10 * UNIT),
+            &PRICE,
+            &(NOW + 1_000),
+            &None,
+        );
+
+        assert_eq!(f.client.get_order(&expired), None);
+        assert_eq!(f.client.best_order(&Side::Bid), None);
+        assert_eq!(f.client.best_order(&Side::Ask).unwrap().id, ask);
+        assert_eq!(balance(&f.env, &f.sy, &f.maker), maker_before);
     }
 
     #[test]

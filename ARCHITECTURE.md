@@ -295,10 +295,12 @@ fills the best opposite order first and may place any remainder afterward.
 
 Fills may be partial. Quote rounding is computed as the difference between two
 cumulative ceiling quotes, so arbitrary partial-fill sequences telescope to the
-same total quote as one full fill. Makers may cancel at any time, expired head
-orders are permissionlessly prunable, and maturity disables placement/fills but
-never cancellation. A bounded taker fee is adjustable only by the configured
-orderbook admin and every update emits a `FeeSet` event.
+same total quote as one full fill. Makers may cancel at any time, `prune_expired`
+reclaims expired head orders permissionlessly, and placement and fills reclaim a
+bounded number of expired heads first so a stale best order cannot stall the
+book; maturity disables placement/fills but never cancellation. A bounded taker
+fee is adjustable only by the configured orderbook admin and every update emits a
+`FeeSet` event.
 
 ---
 
