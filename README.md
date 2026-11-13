@@ -4,8 +4,10 @@ Soroban smart contracts for [Sidereal](https://www.sidereal.tech), yield
 tokenization on Stellar: split a yield-bearing position into a principal token
 (PT) and a yield token (YT), trade either, recombine or redeem at maturity.
 
-Live on Stellar mainnet since 2026-07-11. Not professionally audited; the
-contracts are immutable, so treat the deployment as early and unaudited.
+V1 ran as a small mainnet pilot from 2026-07-10 until its single market matured
+on 2026-08-09; every position has been redeemed and V1 is retired. V2 runs on
+Stellar testnet only. Not professionally audited; the contracts are immutable,
+and mainnet waits for an independent audit.
 
 - Protocol design: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 - Deployment manifests and provenance: [`deployments/`](./deployments/)
